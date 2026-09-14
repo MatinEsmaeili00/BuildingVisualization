@@ -1,0 +1,14 @@
+# UE build output - all regenerable, none of it belongs in the repo.
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.sln
+*.suo
+*.VC.db
+*.opendb
+.vs/
+
+# Python bytecode from editor script runs
+__pycache__/
+*.pyc

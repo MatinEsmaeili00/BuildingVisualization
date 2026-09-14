@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Building Visualization",
+	"Description": "Scalable clipping, isolation and ghosting for large digital-twin buildings. Global shader-driven spatial clipping with no per-mesh material work.",
+	"Category": "Rendering",
+	"CreatedBy": "Matin Esmaeili",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BuildingVisualization",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

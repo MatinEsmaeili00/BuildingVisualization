@@ -1,0 +1,171 @@
+// Copyright Matin. All Rights Reserved.
+//
+// Spatial clipping for building geometry.
+//
+// Included by the generated material function MF_BuildingClip through a Custom
+// node, so this code ends up compiled into every clippable material. Keep it
+// cheap: it runs per pixel, on every surface in the building, every frame.
+//
+// The contract with the CPU side (BuildingVisualizationSubsystem) is the
+// packing of the four vectors per volume:
+//
+//   Row0/Row1/Row2 : rows of the world-to-local matrix, translation in .w
+//   Params         : .xyz = local half-extents, .w = EBuildingClipMode
+//
+// Nothing here reads a Material Parameter Collection directly. The collection
+// values arrive as Custom node inputs, because a .ush has no way to name an
+// MPC uniform - the material compiler generates those names itself.
+
+#pragma once
+
+#define BUILDING_CLIP_MODE_DISABLED    0.0f
+#define BUILDING_CLIP_MODE_CUT_INSIDE  1.0f
+#define BUILDING_CLIP_MODE_CUT_OUTSIDE 2.0f
+
+/**
+ * Signed distance from a world position to the surface of one oriented box.
+ * Negative inside, positive outside, and - importantly - metric in world
+ * units on both sides, which is what lets a single feather width in
+ * centimetres behave identically on every volume regardless of its scale.
+ *
+ * Two steps.
+ *
+ * 1. World to local. The matrix already carries rotation and scale, so the
+ *    oriented box collapses to an axis-aligned one and the test needs no
+ *    quaternion, no per-axis scale and no branching on shape. This is the
+ *    whole reason the CPU sends a matrix rather than a centre and a rotator.
+ *
+ * 2. The axis-aligned box SDF (Inigo Quilez's formulation):
+ *
+ *        q = abs(local) - extents
+ *        d = length(max(q, 0)) + min(max(q.x, q.y, q.z), 0)
+ *
+ *    Worth unpacking, because it looks like two unrelated terms bolted
+ *    together and it is not. Outside the box at least one component of q is
+ *    positive; max(q,0) zeroes the axes we are already within, leaving the
+ *    true Euclidean distance to the nearest face, edge or corner - which is
+ *    what makes corners round correctly instead of reporting the distance to
+ *    an infinite slab. That term is zero inside, where every component of q is
+ *    negative. Inside, the second term takes over: all components are
+ *    negative, so the largest is the least-negative, i.e. the distance to the
+ *    *nearest* face, correctly signed. That term is zero outside. Exactly one
+ *    of the two is active at a time, so their sum is the signed distance
+ *    everywhere, with no branch.
+ */
+float BuildingClip_BoxSDF(float3 WorldPosition, float4 Row0, float4 Row1, float4 Row2, float3 Extents)
+{
+	float3 Local;
+	Local.x = dot(Row0.xyz, WorldPosition) + Row0.w;
+	Local.y = dot(Row1.xyz, WorldPosition) + Row1.w;
+	Local.z = dot(Row2.xyz, WorldPosition) + Row2.w;
+
+	const float3 q = abs(Local) - Extents;
+	return length(max(q, 0.0f)) + min(max(q.x, max(q.y, q.z)), 0.0f);
+}
+
+/**
+ * Coverage contributed by one volume: 1 keeps the pixel, 0 removes it.
+ *
+ * Feathering divides the signed distance by the feather width and saturates,
+ * turning the binary in/out decision into a ramp a few units wide. Without it
+ * the cut edge lands wherever pixel centres happen to fall and crawls as the
+ * box moves, because the test is a step function being point-sampled. The
+ * ramp gives the opacity mask something to dither or blend against, which is
+ * what makes the edge read as clean rather than as stair-stepped aliasing.
+ *
+ * A disabled volume returns 1 rather than being skipped. There is no branch to
+ * skip it with - the slots are unrolled and every pixel evaluates all of them -
+ * so "disabled" has to mean "contributes nothing", and for an intersection
+ * that identity is 1.
+ */
+float BuildingClip_VolumeCoverage(
+	float3 WorldPosition,
+	float4 Row0, float4 Row1, float4 Row2, float4 Params,
+	float  FeatherWidth)
+{
+	const float Mode = Params.w;
+
+	// Guard the divide rather than the branch: a zero feather is the common
+	// "I want a hard edge" case and must not produce a NaN.
+	const float SafeFeather = max(FeatherWidth, 0.0001f);
+	const float Distance = BuildingClip_BoxSDF(WorldPosition, Row0, Row1, Row2, Params.xyz);
+
+	// Cut inside: keep what is outside the box, so coverage rises with
+	// positive distance.
+	const float CutInsideCoverage = saturate(Distance / SafeFeather);
+
+	// Cut outside: keep what is inside, so the sense is reversed.
+	const float CutOutsideCoverage = saturate(-Distance / SafeFeather);
+
+	// Select without branching. Mode is a float carrying an enum, so compare
+	// against midpoints rather than testing equality on floats.
+	float Coverage = 1.0f;
+	Coverage = (Mode > 0.5f && Mode < 1.5f) ? CutInsideCoverage  : Coverage;
+	Coverage = (Mode > 1.5f)                ? CutOutsideCoverage : Coverage;
+	return Coverage;
+}
+
+/**
+ * Combine every slot into a single opacity mask.
+ *
+ * The two modes compose differently, and getting this wrong is the difference
+ * between a usable tool and a confusing one:
+ *
+ *   Cut Inside volumes are SUBTRACTIVE. Each removes its own contents, so
+ *   their effects accumulate - the pixel must survive all of them. Taking the
+ *   minimum is a soft boolean AND, which for coverage values is exactly the
+ *   intersection of "not removed by this volume".
+ *
+ *   Cut Outside volumes are RESTRICTIVE. Each keeps only its own contents, so
+ *   a pixel inside ANY of them should survive - two isolated rooms should show
+ *   both rooms, not the empty intersection of the two, which is what taking the
+ *   minimum would give. Hence maximum: a soft boolean OR.
+ *
+ * So: intersect the keeps, union the isolates, then intersect the two results.
+ * That is standard CSG, and it generalises - adding more modes later means
+ * deciding which of these two accumulators the new mode feeds.
+ *
+ * KeepMask starts at 1 (identity for AND). IsolateMask starts at 0 (identity
+ * for OR) and is only applied if at least one isolate volume exists, since
+ * otherwise "no isolation requested" would be indistinguishable from "isolate
+ * nothing" and the whole building would vanish.
+ */
+float BuildingClip_Evaluate(
+	float3 WorldPosition,
+	float4 Row0_0, float4 Row1_0, float4 Row2_0, float4 Params_0,
+	float4 Row0_1, float4 Row1_1, float4 Row2_1, float4 Params_1,
+	float4 Row0_2, float4 Row1_2, float4 Row2_2, float4 Params_2,
+	float4 Row0_3, float4 Row1_3, float4 Row2_3, float4 Params_3,
+	float4 Globals)
+{
+	const float FeatherWidth = Globals.y;
+
+	float KeepMask = 1.0f;
+	float IsolateMask = 0.0f;
+	float AnyIsolate = 0.0f;
+
+	// Unrolled deliberately. A material graph cannot express a loop, and even
+	// in raw HLSL a dynamic loop here would cost more than four straight-line
+	// evaluations of a handful of instructions each.
+	#define BUILDING_CLIP_ACCUMULATE(R0, R1, R2, P)                                            \
+	{                                                                                          \
+		const float Mode = (P).w;                                                              \
+		const float Coverage = BuildingClip_VolumeCoverage(WorldPosition, R0, R1, R2, P, FeatherWidth); \
+		const float bIsolate = (Mode > 1.5f) ? 1.0f : 0.0f;                                    \
+		KeepMask    = lerp(min(KeepMask, Coverage), KeepMask, bIsolate);                       \
+		IsolateMask = lerp(IsolateMask, max(IsolateMask, Coverage), bIsolate);                 \
+		AnyIsolate  = max(AnyIsolate, bIsolate);                                               \
+	}
+
+	BUILDING_CLIP_ACCUMULATE(Row0_0, Row1_0, Row2_0, Params_0)
+	BUILDING_CLIP_ACCUMULATE(Row0_1, Row1_1, Row2_1, Params_1)
+	BUILDING_CLIP_ACCUMULATE(Row0_2, Row1_2, Row2_2, Params_2)
+	BUILDING_CLIP_ACCUMULATE(Row0_3, Row1_3, Row2_3, Params_3)
+
+	#undef BUILDING_CLIP_ACCUMULATE
+
+	// Only let the isolate accumulator restrict anything if one was actually
+	// supplied. lerp rather than a branch, for the same reason as above.
+	const float Result = lerp(KeepMask, min(KeepMask, IsolateMask), AnyIsolate);
+	return Result;
+}
