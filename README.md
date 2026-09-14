@@ -257,6 +257,37 @@ The clip mask and ghost alpha are returned separately (`float2`) rather than
 pre-multiplied, because only the ghost half should be dithered — stippling the
 clip mask would make the cut edge crawl instead of staying crisp.
 
+## Console commands
+
+Everything is drivable from the console, in the **editor viewport as well as
+PIE** — no recompile, no Blueprint wiring, no play session needed.
+
+| Command | Does |
+|---|---|
+| `BV.SelectFloor Floor.03` | Focus one storey |
+| `BV.SelectRoom Room.301` | Isolate a room |
+| `BV.SelectSystem System.Pipe` | Isolate a system |
+| `BV.ClearSelection` | Clear selection, leave placed clip volumes alone |
+| `BV.Ghost 1` | Fade out-of-focus geometry |
+| `BV.GhostOpacity 0.15` | How faint the ghost is |
+| `BV.Clip 0` | Master clipping switch |
+| `BV.Reset` | Reset everything |
+| `BV.Status` | Print all current state |
+| `BV.ListTags Room.` | Every actor tag in the world, with counts |
+| `BV.DescribeTag Room.301` | Every actor with a tag: **class** and bounds |
+
+The three inspection commands exist because **every failure this system can
+have looks identical from the viewport: nothing happens.** A tag typo, geometry
+imported without metadata, an unset parameter collection, and a material
+missing the clip function are four unrelated problems with one symptom.
+`BV.Status` distinguishes them in one line each.
+
+`BV.DescribeTag` is the one that answers *"is my room isolation using the
+trigger volume or the walls?"* — both produce a box, and a wrong one just looks
+like a badly sized room, so the **class** column is the actual answer.
+`SelectRoom` also warns on its own if a tag is carried by more than one actor
+class, since that union is silently larger than the room.
+
 ## Roadmap
 
 - [x] Movable/scalable clip volume actor

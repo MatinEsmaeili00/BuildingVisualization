@@ -111,6 +111,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Ghosting")
 	void SetGhostOpacity(float NewOpacity);
 
+	/**
+	 * Dumps everything that decides what you are currently looking at.
+	 *
+	 * Worth having as a first-class function rather than a debugger watch,
+	 * because every distinct failure of this system presents identically from
+	 * the viewport - as nothing happening - and this separates them.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization")
+	void LogStatus() const;
+
 private:
 	/** Gathers registered volumes, sorts by priority, writes the collection. */
 	void PushClipParameters();

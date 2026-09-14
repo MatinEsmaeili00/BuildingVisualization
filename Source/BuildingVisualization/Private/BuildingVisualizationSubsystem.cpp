@@ -177,6 +177,12 @@ bool UBuildingVisualizationSubsystem::ComputeTaggedBounds(FName Tag, FBox& OutBo
 	OutBounds = FBox(ForceInit);
 	int32 MatchCount = 0;
 
+	// Counted per class so the log can say WHAT matched, not just how many.
+	// A room tag is meant to land on its trigger volume; if it also lands on
+	// the walls, the union is silently the wrong box and the only visible
+	// symptom is an isolation that looks slightly too big.
+	TMap<FName, int32> ClassCounts;
+
 	// This is the one place the system looks at the building, and it runs on
 	// selection, not on tick. An iteration over every actor is acceptable at
 	// the moment a user clicks "floor 8"; it would not be acceptable at 60Hz,
@@ -196,6 +202,7 @@ bool UBuildingVisualizationSubsystem::ComputeTaggedBounds(FName Tag, FBox& OutBo
 		Actor->GetActorBounds(/*bOnlyCollidingComponents=*/false, Origin, Extent);
 		OutBounds += FBox(Origin - Extent, Origin + Extent);
 		++MatchCount;
+		++ClassCounts.FindOrAdd(Actor->GetClass()->GetFName());
 	}
 
 	if (MatchCount == 0)
@@ -207,9 +214,37 @@ bool UBuildingVisualizationSubsystem::ComputeTaggedBounds(FName Tag, FBox& OutBo
 		return false;
 	}
 
-	UE_LOG(LogBuildingVisualization, Verbose,
-		TEXT("Tag '%s' matched %d actor(s); bounds Z %.1f..%.1f"),
-		*Tag.ToString(), MatchCount, OutBounds.Min.Z, OutBounds.Max.Z);
+	// Built as "TriggerVolume x1, StaticMeshActor x12" so the log answers
+	// which geometry defined the bounds without needing a separate query.
+	FString Breakdown;
+	for (const TPair<FName, int32>& Pair : ClassCounts)
+	{
+		if (!Breakdown.IsEmpty())
+		{
+			Breakdown += TEXT(", ");
+		}
+		Breakdown += FString::Printf(TEXT("%s x%d"), *Pair.Key.ToString(), Pair.Value);
+	}
+
+	const FVector Extent = OutBounds.GetExtent();
+	UE_LOG(LogBuildingVisualization, Display,
+		TEXT("Tag '%s' matched %d actor(s) [%s]; Z %.1f..%.1f, extent (%.0f, %.0f, %.0f)"),
+		*Tag.ToString(), MatchCount, *Breakdown,
+		OutBounds.Min.Z, OutBounds.Max.Z, Extent.X, Extent.Y, Extent.Z);
+
+	// A room or system tag is expected to be carried by one bounding volume.
+	// Landing on several different classes usually means the tag was applied
+	// to the contents as well as the container, and the resulting union is
+	// then larger than the room - which is very hard to spot by eye.
+	if (ClassCounts.Num() > 1)
+	{
+		UE_LOG(LogBuildingVisualization, Warning,
+			TEXT("Tag '%s' is carried by %d different actor classes [%s]. If this is a room or ")
+			TEXT("system tag it should usually be on ONE bounding volume - the bounds above are the ")
+			TEXT("union of all of them, which may be larger than you intend."),
+			*Tag.ToString(), ClassCounts.Num(), *Breakdown);
+	}
+
 	return true;
 }
 
@@ -300,6 +335,68 @@ void UBuildingVisualizationSubsystem::EnableGhostMode(bool bEnabled)
 		bGhostEnabled = bEnabled;
 		bVolumesDirty = true;
 	}
+}
+
+void UBuildingVisualizationSubsystem::LogStatus() const
+{
+	int32 LiveVolumes = 0;
+	int32 ActiveVolumes = 0;
+	for (const TWeakObjectPtr<AClippingVolumeActor>& Weak : RegisteredVolumes)
+	{
+		if (const AClippingVolumeActor* Volume = Weak.Get())
+		{
+			++LiveVolumes;
+			if (Volume->ClipMode != EBuildingClipMode::Disabled)
+			{
+				++ActiveVolumes;
+			}
+		}
+	}
+
+	UE_LOG(LogBuildingVisualization, Display, TEXT("--- Building Visualization status ---"));
+	UE_LOG(LogBuildingVisualization, Display, TEXT("  World            : %s"),
+		GetWorld() ? *GetWorld()->GetName() : TEXT("<none>"));
+
+	// Reported first, because if this is wrong nothing else matters - every
+	// other setting below will look perfectly correct while having no effect.
+	UE_LOG(LogBuildingVisualization, Display, TEXT("  Collection       : %s (layout %s)"),
+		ParameterCollection ? *ParameterCollection->GetName() : TEXT("<NOT SET - nothing will work>"),
+		bParameterNamesValid ? TEXT("valid") : TEXT("INVALID - regenerate with the Python script"));
+
+	UE_LOG(LogBuildingVisualization, Display, TEXT("  Clipping         : %s"),
+		bClippingEnabled ? TEXT("on") : TEXT("off"));
+	UE_LOG(LogBuildingVisualization, Display, TEXT("  Clip volumes     : %d registered, %d active, %d slots"),
+		LiveVolumes, ActiveVolumes, BuildingVisualization::MaxClipVolumes);
+
+	if (bFocusSlabActive)
+	{
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  Focus slab       : Z %.1f .. %.1f (feather %.1f)"),
+			FocusSlabMinZ, FocusSlabMaxZ, FocusSlabFeather);
+	}
+	else
+	{
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  Focus slab       : none (no floor selected)"));
+	}
+
+	if (bSelectionIsolationActive && SelectionIsolationBounds.IsValid)
+	{
+		const FVector C = SelectionIsolationBounds.GetCenter();
+		const FVector E = SelectionIsolationBounds.GetExtent();
+		UE_LOG(LogBuildingVisualization, Display,
+			TEXT("  Room isolation   : centre (%.0f, %.0f, %.0f) extent (%.0f, %.0f, %.0f)"),
+			C.X, C.Y, C.Z, E.X, E.Y, E.Z);
+	}
+	else
+	{
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  Room isolation   : none"));
+	}
+
+	UE_LOG(LogBuildingVisualization, Display, TEXT("  Ghost            : %s, opacity %.2f%s"),
+		bGhostEnabled ? TEXT("on") : TEXT("off"), GhostOpacity,
+		(bGhostEnabled && !bFocusSlabActive)
+			? TEXT("  <-- NO EFFECT: nothing is out of focus without a floor selected")
+			: TEXT(""));
+	UE_LOG(LogBuildingVisualization, Display, TEXT("-------------------------------------"));
 }
 
 void UBuildingVisualizationSubsystem::SetGhostOpacity(float NewOpacity)
