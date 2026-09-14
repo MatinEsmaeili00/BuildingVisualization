@@ -130,13 +130,63 @@ float BuildingClip_VolumeCoverage(
  * otherwise "no isolation requested" would be indistinguishable from "isolate
  * nothing" and the whole building would vanish.
  */
-float BuildingClip_Evaluate(
+/**
+ * How much this pixel belongs to the focused region.
+ *
+ * 1 = in focus (draw normally), 0 = out of focus (ghost it).
+ *
+ * A floor of a building is a slab in Z, which is the whole reason floor
+ * isolation needs no per-object data whatsoever. Room and system selection
+ * cannot work this way - a room is not a world-space predicate - and those go
+ * through per-primitive stencil instead. But floors are the common case and
+ * the expensive one, so it is worth having the cheap path.
+ *
+ * FocusSlab: .x = min Z, .y = max Z, .z = enabled, .w = feather in world units.
+ */
+float BuildingClip_FocusSlab(float3 WorldPosition, float4 FocusSlab)
+{
+	if (FocusSlab.z < 0.5f)
+	{
+		return 1.0f;   // no floor selected: everything is in focus
+	}
+
+	const float Feather = max(FocusSlab.w, 0.0001f);
+
+	// Distance INTO the slab from each face, positive inside. Taking the min
+	// gives distance to the nearer face, so one saturate feathers both edges
+	// and the ceiling and floor of a storey fade symmetrically.
+	const float FromBottom = WorldPosition.z - FocusSlab.x;
+	const float FromTop    = FocusSlab.y - WorldPosition.z;
+	return saturate(min(FromBottom, FromTop) / Feather);
+}
+
+/**
+ * Returns .x = clip mask, .y = ghost alpha.
+ *
+ * Two outputs rather than one because they are consumed differently and must
+ * not be pre-multiplied here. The clip mask is a hard geometric decision. The
+ * ghost alpha is a *coverage* that the material graph feeds through
+ * DitherTemporalAA, which converts it into a stipple pattern that TAA then
+ * resolves into apparent translucency.
+ *
+ * That distinction is what makes ghosting free. A post-process tint cannot
+ * make an opaque wall see-through, because whatever is behind it was never
+ * rendered - the pixels do not exist to blend with. Making the material
+ * Translucent would work but changes sorting, disables a lot of the deferred
+ * pipeline, and cannot be toggled per frame. Dithering a Masked material costs
+ * nothing extra, because the injector has already made every clippable
+ * material Masked in order to clip correctly in the depth prepass. The ghost
+ * mode rides on machinery the clip feature had to build anyway.
+ *
+ * GhostParams: .x = ghost opacity 0..1, .y = enabled, .z/.w reserved.
+ */
+float2 BuildingClip_Evaluate(
 	float3 WorldPosition,
 	float4 Row0_0, float4 Row1_0, float4 Row2_0, float4 Params_0,
 	float4 Row0_1, float4 Row1_1, float4 Row2_1, float4 Params_1,
 	float4 Row0_2, float4 Row1_2, float4 Row2_2, float4 Params_2,
 	float4 Row0_3, float4 Row1_3, float4 Row2_3, float4 Params_3,
-	float4 Globals)
+	float4 Globals, float4 FocusSlab, float4 GhostParams)
 {
 	const float FeatherWidth = Globals.y;
 
@@ -166,6 +216,23 @@ float BuildingClip_Evaluate(
 
 	// Only let the isolate accumulator restrict anything if one was actually
 	// supplied. lerp rather than a branch, for the same reason as above.
-	const float Result = lerp(KeepMask, min(KeepMask, IsolateMask), AnyIsolate);
-	return Result;
+	const float ClipMask = lerp(KeepMask, min(KeepMask, IsolateMask), AnyIsolate);
+
+	// --- Ghosting -----------------------------------------------------------
+	//
+	// Out-of-focus geometry fades to GhostParams.x rather than vanishing, so
+	// the building keeps its context: you can still read where the isolated
+	// floor sits inside the whole structure, which is most of the value of a
+	// digital twin view.
+	const float InFocus = BuildingClip_FocusSlab(WorldPosition, FocusSlab);
+
+	float GhostAlpha = 1.0f;
+	if (GhostParams.y > 0.5f)
+	{
+		// lerp, not a step: InFocus is already feathered at the slab edges, so
+		// the storey above fades in over a few centimetres instead of popping.
+		GhostAlpha = lerp(GhostParams.x, 1.0f, InFocus);
+	}
+
+	return float2(ClipMask, GhostAlpha);
 }

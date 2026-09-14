@@ -196,16 +196,77 @@ It works in the editor viewport, not just in PIE — the subsystem ticks in edit
 worlds deliberately, because dragging the box through the building while
 building the level is the primary way this gets used.
 
+---
+
+## Selection and ghosting
+
+```cpp
+Subsystem->SelectFloor(TEXT("Floor.08"));   // focus one storey
+Subsystem->EnableGhostMode(true);           // fade everything else
+Subsystem->SelectRoom(TEXT("Room.802"));    // isolate a room
+Subsystem->ClearSelection();
+```
+
+Selection resolves tags **once, when it changes** — never on tick. Iterating
+actors the moment a user clicks "floor 8" is fine; doing it at 60 Hz is not,
+and nothing in `Tick` does anything like it.
+
+### Floors are slabs; rooms are not
+
+The two take deliberately different routes:
+
+- **`SelectFloor`** resolves the tag to a Z range and publishes it as a slab
+  every material tests against. A storey *is* a slab in Z, so this needs **no
+  per-object data at all** — one vector, and it works identically on a building
+  of any size. Only the Z range is kept: the horizontal extent of a storey is
+  the whole footprint, so testing against it would only break an L-shaped plan.
+- **`SelectRoom` / `SelectSystem`** cannot work that way — a room is not a
+  world-space predicate. These derive an AABB from the tagged actors and drive
+  an internal **Cut Outside** volume with it, reusing the clip machinery rather
+  than inventing a second mechanism. Note this consumes one of the
+  `MaxClipVolumes` slots, and it is inserted *first* so that user-placed boxes
+  are the ones dropped if the level exceeds the slot count.
+
+### Plain actor tags, not Gameplay Tags
+
+Gameplay Tags must exist in a central registry before they can be applied,
+which would mean registering several thousand (`Floor.01`…`Floor.40`, every
+room number) before a single actor could be tagged. Actor tags are free-form,
+so an importer can write whatever the BIM data says with no registration step —
+and hierarchy still works by prefix, since `"Floor."` matches `"Floor.08"`.
+
+### Ghosting is dithered, not tinted
+
+Out-of-focus geometry fades to `GhostOpacity` rather than vanishing, so the
+building keeps its context — you can still read where the isolated floor sits
+inside the whole structure.
+
+**A post-process tint cannot make an opaque wall see-through.** Whatever is
+behind it was never rendered; those pixels do not exist to blend with. Making
+materials Translucent would work but changes sorting, gives up much of the
+deferred pipeline, and cannot be toggled per frame.
+
+So the ghost alpha is fed through the engine's `DitherTemporalAA`, which turns
+coverage into a jitter-aware stipple that TAA resolves into apparent
+translucency — the same mechanism as UE's own LOD dithering. **It costs
+nothing**, because the injector already had to make every clippable material
+Masked in order to clip correctly in the depth prepass. Ghost mode rides on
+machinery the clip feature was forced to build anyway.
+
+The clip mask and ghost alpha are returned separately (`float2`) rather than
+pre-multiplied, because only the ghost half should be dithered — stippling the
+clip mask would make the cut edge crawl instead of staying crisp.
+
 ## Roadmap
 
 - [x] Movable/scalable clip volume actor
 - [x] Global shader parameters via MPC
 - [x] World-space oriented-box clipping, multi-volume CSG
 - [x] Scripted bulk injection into existing materials
-- [ ] `BuildingVisualizationManager` — `SelectFloor` / `SelectRoom` / `SelectSystem`
-- [ ] Semantic selection via Gameplay Tags (`Floor.08`, `System.Pipe`, …)
-- [ ] Ghost / X-ray mode via Custom Depth-Stencil + post process
-- [ ] Combined floor isolation + clipping + ghosting
+- [x] Manager API — `SelectFloor` / `SelectRoom` / `SelectSystem` / `ResetVisualization`
+- [x] Semantic selection via actor tags (`Floor.08`, `System.Pipe`, …)
+- [x] Ghost mode via dithered opacity
+- [x] Combined floor isolation + clipping + ghosting
 - [ ] Capped cross-sections (solid cut faces)
 
 ## Licence

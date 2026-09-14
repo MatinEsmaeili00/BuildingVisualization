@@ -60,6 +60,70 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Material Bridge")
 	FName GlobalsParameterName;
 
+	/** Vector carrying the focused Z slab: X = min Z, Y = max Z, Z = enabled, W = feather. */
+	UPROPERTY(config, EditAnywhere, Category = "Material Bridge")
+	FName FocusSlabParameterName;
+
+	/** Vector carrying ghost state: X = ghost opacity, Y = enabled, Z/W reserved. */
+	UPROPERTY(config, EditAnywhere, Category = "Material Bridge")
+	FName GhostParameterName;
+
+	// --- Semantic selection -------------------------------------------------
+
+	/**
+	 * Actor tag prefixes the selection API matches against.
+	 *
+	 * Plain FName actor tags rather than Gameplay Tags, deliberately. Gameplay
+	 * Tags must exist in a central registry before they can be applied, which
+	 * means a building import would have to register several thousand of them
+	 * (Floor.01 through Floor.40, every room number) before a single actor
+	 * could be tagged. Actor tags are free-form strings, so an importer can
+	 * write whatever the BIM data says without a registration step, and
+	 * hierarchy still works by prefix: "Floor." matches "Floor.08".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Selection")
+	FName FloorTagPrefix;
+
+	UPROPERTY(config, EditAnywhere, Category = "Selection")
+	FName RoomTagPrefix;
+
+	UPROPERTY(config, EditAnywhere, Category = "Selection")
+	FName SystemTagPrefix;
+
+	/**
+	 * World units the focus slab fades over at its top and bottom faces.
+	 *
+	 * Larger than the clip feather because this edge is a soft visual
+	 * transition between a focused storey and its neighbours, not a cut - a
+	 * hard line across a stairwell reads as an error, a gradient reads as
+	 * depth of field.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Selection", meta = (ClampMin = "0.0"))
+	float FocusSlabFeather;
+
+	/**
+	 * How much the slab is grown beyond the tagged geometry's bounds.
+	 *
+	 * A floor's tagged actors stop at the ceiling, but the slab derived from
+	 * them should include the ceiling itself and a little of the structure
+	 * above, or the top surface of the storey you selected fades out.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Selection")
+	float FocusSlabPadding;
+
+	// --- Ghosting -----------------------------------------------------------
+
+	/**
+	 * Opacity of out-of-focus geometry, 0..1. 0 hides it entirely.
+	 *
+	 * Delivered as a dither pattern on an already-Masked material rather than
+	 * as true translucency, so it costs nothing and needs no blend mode
+	 * change. Very low values stipple visibly before TAA resolves them;
+	 * around 0.1-0.25 reads as glass.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Ghosting", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float GhostOpacity;
+
 	// --- Behaviour ----------------------------------------------------------
 
 	/**

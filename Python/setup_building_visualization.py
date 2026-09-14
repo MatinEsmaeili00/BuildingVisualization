@@ -34,12 +34,50 @@ MAX_CLIP_VOLUMES = 4
 # Must match UBuildingVisualizationSettings defaults.
 CLIP_PREFIX = "Clip"
 GLOBALS_NAME = "ClipGlobals"
+FOCUS_SLAB_NAME = "ClipFocusSlab"
+GHOST_NAME = "ClipGhost"
 
 ASSET_PATH = "/Game/BuildingVisualization"
 MPC_NAME = "MPC_BuildingClip"
 FUNCTION_NAME = "MF_BuildingClip"
 
 INCLUDE_PATH = "/BuildingVisualization/Private/BuildingClipping.ush"
+
+# Engine-provided, and a material function rather than a native expression -
+# which is why it is referenced by path instead of constructed by class.
+#
+# Both spellings are tried because load_asset is inconsistent about whether it
+# wants the trailing object name, and which one works has changed between
+# engine versions. Cheap to try both; a wrong guess costs a confusing failure
+# well downstream of the actual cause.
+DITHER_FUNCTION_PATHS = [
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/DitherTemporalAA",
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/DitherTemporalAA.DitherTemporalAA",
+]
+
+
+def _load_dither_function():
+    """
+    Loads the engine dither function, tolerating both path spellings.
+
+    unreal.load_asset() is used in preference to
+    EditorAssetLibrary.load_asset(): the latter resolves only the FULL object
+    path (".../DitherTemporalAA.DitherTemporalAA") and returns None for the
+    package-only form, while the global accepts either. Verified by probe on
+    5.8 - EditorAssetLibrary.does_asset_exist() likewise reports False for the
+    package-only path, which is what makes this failure so confusing when you
+    hit it: the file is plainly there on disk.
+    """
+    for path in DITHER_FUNCTION_PATHS:
+        for loader in (unreal.load_asset, unreal.EditorAssetLibrary.load_asset):
+            try:
+                asset = loader(path)
+            except Exception:
+                asset = None
+            if asset is not None:
+                _log("Using dither function: {}".format(path))
+                return asset
+    return None
 
 _asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 _mel = unreal.MaterialEditingLibrary
@@ -58,6 +96,8 @@ def _param_names():
         names.append("{}Row2_{}".format(CLIP_PREFIX, i))
         names.append("{}Params_{}".format(CLIP_PREFIX, i))
     names.append(GLOBALS_NAME)
+    names.append(FOCUS_SLAB_NAME)
+    names.append(GHOST_NAME)
     return names
 
 
@@ -115,7 +155,8 @@ def _build_custom_node_code():
             "Row0_{}".format(i), "Row1_{}".format(i),
             "Row2_{}".format(i), "Params_{}".format(i),
         ])
-    return "return BuildingClip_Evaluate(WorldPos, {}, Globals);".format(", ".join(args))
+    return "return BuildingClip_Evaluate(WorldPos, {}, Globals, FocusSlab, Ghost);".format(
+        ", ".join(args))
 
 
 def create_material_function():
@@ -130,14 +171,23 @@ def create_material_function():
     """
     package = "{}/{}".format(ASSET_PATH, FUNCTION_NAME)
 
+    # Rebuild the graph IN PLACE rather than deleting and recreating the asset.
+    #
+    # Deleting it would dangle the function-call node in every material already
+    # injected - and since this script is meant to be re-run as the system
+    # evolves, that would mean re-injecting the whole building after every
+    # change, or worse, silently leaving materials pointing at nothing. Keeping
+    # the same asset means existing references stay valid and simply pick up
+    # the new graph.
     if unreal.EditorAssetLibrary.does_asset_exist(package):
-        unreal.EditorAssetLibrary.delete_asset(package)
-        _log("Removed previous material function so it can be rebuilt cleanly.")
-
-    func = _asset_tools.create_asset(
-        FUNCTION_NAME, ASSET_PATH,
-        unreal.MaterialFunction,
-        unreal.MaterialFunctionFactoryNew())
+        func = unreal.EditorAssetLibrary.load_asset(package)
+        _mel.delete_all_material_expressions_in_function(func)
+        _log("Rebuilding existing material function in place (references preserved).")
+    else:
+        func = _asset_tools.create_asset(
+            FUNCTION_NAME, ASSET_PATH,
+            unreal.MaterialFunction,
+            unreal.MaterialFunctionFactoryNew())
 
     collection = unreal.EditorAssetLibrary.load_asset("{}/{}".format(ASSET_PATH, MPC_NAME))
     if collection is None:
@@ -146,7 +196,11 @@ def create_material_function():
     custom = _mel.create_material_expression_in_function(
         func, unreal.MaterialExpressionCustom, -400, 0)
     custom.set_editor_property("code", _build_custom_node_code())
-    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+    # FLOAT2: .r is the hard clip decision, .g is the ghost coverage. They are
+    # returned separately rather than pre-multiplied because only the ghost
+    # half should go through the dither - dithering the clip mask would make
+    # the cut edge stipple instead of being crisp.
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT2)
     custom.set_editor_property("description", "BuildingClip")
     custom.set_editor_property("include_file_paths", [INCLUDE_PATH])
 
@@ -179,13 +233,67 @@ def create_material_function():
     for ident, node in inputs:
         _mel.connect_material_expressions(node, "", custom, ident)
 
+    # --- Split the two outputs -------------------------------------------
+    #
+    # A ComponentMask taking .r and .g off a float2 is valid precisely because
+    # the Custom node above declares CMOT_FLOAT2. Masking a channel the source
+    # does not have is a compile error that takes the whole material down and
+    # substitutes the Default Material - so the output type and these masks
+    # have to be changed together, always.
+    clip_mask = _mel.create_material_expression_in_function(
+        func, unreal.MaterialExpressionComponentMask, -200, -80)
+    clip_mask.set_editor_property("r", True)
+    clip_mask.set_editor_property("g", False)
+    clip_mask.set_editor_property("b", False)
+    clip_mask.set_editor_property("a", False)
+    _mel.connect_material_expressions(custom, "", clip_mask, "")
+
+    ghost_mask = _mel.create_material_expression_in_function(
+        func, unreal.MaterialExpressionComponentMask, -200, 80)
+    ghost_mask.set_editor_property("r", False)
+    ghost_mask.set_editor_property("g", True)
+    ghost_mask.set_editor_property("b", False)
+    ghost_mask.set_editor_property("a", False)
+    _mel.connect_material_expressions(custom, "", ghost_mask, "")
+
+    # --- Ghost coverage becomes a stipple --------------------------------
+    #
+    # DitherTemporalAA converts a 0..1 coverage into a per-pixel on/off
+    # pattern that varies with the TAA jitter, so temporal accumulation
+    # resolves it into apparent translucency. This is how UE's own LOD
+    # dithering works.
+    #
+    # The engine node is used rather than a Bayer matrix in the .ush because
+    # it is jitter-aware: a static ordered dither locks to screen space and
+    # crawls when the camera moves, which looks like a rendering artifact
+    # rather than like glass.
+    # DitherTemporalAA is an engine MATERIAL FUNCTION, not a native expression
+    # class - there is no unreal.MaterialExpressionDitherTemporalAA to create.
+    # It has to be referenced the same way any other function is.
+    dither_func = _load_dither_function()
+    if dither_func is None:
+        raise RuntimeError(
+            "Could not load the engine DitherTemporalAA function from any of {}. "
+            "Ghost mode needs it to convert coverage into a temporally-stable "
+            "stipple.".format(DITHER_FUNCTION_PATHS))
+
+    dither = _mel.create_material_expression_in_function(
+        func, unreal.MaterialExpressionMaterialFunctionCall, -100, 80)
+    dither.set_editor_property("material_function", dither_func)
+    _mel.connect_material_expressions(ghost_mask, "", dither, "Alpha")
+
+    combine = _mel.create_material_expression_in_function(
+        func, unreal.MaterialExpressionMultiply, -40, 0)
+    _mel.connect_material_expressions(clip_mask, "", combine, "A")
+    _mel.connect_material_expressions(dither, "", combine, "B")
+
     output = _mel.create_material_expression_in_function(
-        func, unreal.MaterialExpressionFunctionOutput, 0, 0)
+        func, unreal.MaterialExpressionFunctionOutput, 100, 0)
     output.set_editor_property("output_name", "ClipMask")
     output.set_editor_property(
         "description",
         "1 keeps the pixel, 0 removes it. Multiply into Opacity Mask on a Masked material.")
-    _mel.connect_material_expressions(custom, "", output, "")
+    _mel.connect_material_expressions(combine, "", output, "")
 
     func.set_editor_property(
         "description",

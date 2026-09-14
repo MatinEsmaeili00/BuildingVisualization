@@ -61,9 +61,71 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Building Visualization")
 	void ResetVisualization();
 
+	// --- Semantic selection -------------------------------------------------
+	//
+	// These DO iterate actors - once, when the selection changes. That is the
+	// deliberate line: per-selection iteration is fine (it happens when a user
+	// clicks something), per-frame iteration is not. Nothing below runs on tick.
+
+	/**
+	 * Focuses one storey, e.g. SelectFloor("Floor.08").
+	 *
+	 * Resolves the tag to a Z range from the bounds of the tagged actors, then
+	 * publishes it as a slab every material tests against. A floor IS a slab
+	 * in Z, which is why this needs no per-object data at all and costs one
+	 * vector - it works identically on a building of any size.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Selection")
+	bool SelectFloor(FName FloorTag);
+
+	/**
+	 * Isolates a room by its tag, e.g. SelectRoom("Room.802").
+	 *
+	 * A room is not a world-space predicate the way a floor is, so this takes
+	 * the different route: it derives an axis-aligned bounds from the tagged
+	 * actors and drives an internal Cut Outside volume with it, reusing the
+	 * clip machinery rather than inventing a second mechanism. Note that this
+	 * consumes one of the MaxClipVolumes slots.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Selection")
+	bool SelectRoom(FName RoomTag);
+
+	/** Isolates a system, e.g. SelectSystem("System.Pipe"). Same mechanism as SelectRoom. */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Selection")
+	bool SelectSystem(FName SystemTag);
+
+	/** Clears floor and room/system selection, leaving user-placed clip volumes alone. */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Selection")
+	void ClearSelection();
+
+	// --- Ghosting -----------------------------------------------------------
+
+	/** Fades out-of-focus geometry instead of leaving it fully opaque. */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Ghosting")
+	void EnableGhostMode(bool bEnabled);
+
+	UFUNCTION(BlueprintPure, Category = "Building Visualization|Ghosting")
+	bool IsGhostModeEnabled() const { return bGhostEnabled; }
+
+	/** 0 hides out-of-focus geometry entirely, 1 leaves it fully opaque. */
+	UFUNCTION(BlueprintCallable, Category = "Building Visualization|Ghosting")
+	void SetGhostOpacity(float NewOpacity);
+
 private:
 	/** Gathers registered volumes, sorts by priority, writes the collection. */
 	void PushClipParameters();
+
+	/**
+	 * Union of the bounds of every actor carrying an exact tag.
+	 *
+	 * Returns false when nothing matched, which is the common authoring
+	 * mistake (a typo, or geometry imported without metadata) and is worth
+	 * distinguishing from "matched, but empty".
+	 */
+	bool ComputeTaggedBounds(FName Tag, FBox& OutBounds) const;
+
+	/** Shared by SelectRoom and SelectSystem - they differ only in which prefix they expect. */
+	bool SelectByTagAsIsolation(FName Tag, const FName& ExpectedPrefix, const TCHAR* DebugContext);
 
 	/** Resolved once at Initialize; a soft pointer so a project not using it never loads it. */
 	UPROPERTY(Transient)
@@ -78,11 +140,36 @@ private:
 	TArray<FName> Row2Names;
 	TArray<FName> ParamNames;
 	FName GlobalsName;
+	FName FocusSlabName;
+	FName GhostName;
+
+	FName FloorTagPrefix;
+	FName RoomTagPrefix;
+	FName SystemTagPrefix;
 
 	float EdgeFeatherWidth = 2.0f;
+	float FocusSlabFeather = 25.0f;
+	float FocusSlabPadding = 50.0f;
+	float GhostOpacity = 0.15f;
 	bool bForcePushEveryFrame = false;
 
 	bool bClippingEnabled = true;
+	bool bGhostEnabled = false;
 	bool bVolumesDirty = true;
 	bool bParameterNamesValid = false;
+
+	/** Z range of the focused storey. Only meaningful while bFocusSlabActive. */
+	float FocusSlabMinZ = 0.0f;
+	float FocusSlabMaxZ = 0.0f;
+	bool bFocusSlabActive = false;
+
+	/**
+	 * Isolation bounds from SelectRoom / SelectSystem.
+	 *
+	 * Held as a plain box rather than a spawned actor: spawning an actor to
+	 * carry it would dirty the level, show up in the outliner, and get saved
+	 * into the map, none of which is wanted for what is a transient view state.
+	 */
+	FBox SelectionIsolationBounds = FBox(ForceInit);
+	bool bSelectionIsolationActive = false;
 };
