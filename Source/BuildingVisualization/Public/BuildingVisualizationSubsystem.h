@@ -149,6 +149,8 @@ private:
 	TArray<FName> Row1Names;
 	TArray<FName> Row2Names;
 	TArray<FName> ParamNames;
+	TArray<FName> CenterNames;
+	TArray<FName> ExtentNames;
 	FName GlobalsName;
 	FName FocusSlabName;
 	FName GhostName;

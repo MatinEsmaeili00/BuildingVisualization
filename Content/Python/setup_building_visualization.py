@@ -37,13 +37,37 @@
 # does nothing, with no error in any log. Verified by opening the generated
 # function and looking at it.
 #
-# Material-LEVEL graph building through the same API works reliably. So the
-# whole node group is built directly in each material instead. The cost is
-# ~21 nodes per material rather than one, which is only a cost at injection
-# time - the compiled shader is identical either way, because a material
-# function is inlined at compile time regardless.
+# Material-LEVEL graph building through the same API works reliably, so the
+# whole node group is built directly in each material instead.
 #
-# The trade is real, though: the collection layout is now duplicated into every
+#
+# WHY THERE IS NO CUSTOM NODE EITHER
+# ----------------------------------
+# The function was replaced by a single Custom node calling into
+# BuildingClipping.ush, with the collection parameters wired in as twenty-one
+# named inputs. That compiled cleanly, every parameter verified correct at the
+# C++ end, the collection layout verified valid, masking verified working in an
+# isolated test material - and it cut nothing.
+#
+# A Custom node with twenty-one inputs has exactly one thing that cannot be
+# inspected from outside: whether each named input actually bound to the
+# argument the HLSL expects. Everything else had been checked. Rather than keep
+# testing the one opaque link, it was removed.
+#
+# So the graph below is built from NATIVE material nodes only. No include path,
+# no HLSL string, no input binding. Around 120 nodes per material, all of them
+# visible in the material editor, all of them things the material editor itself
+# would have produced. When it misbehaves now, you can look at it.
+#
+# The cost of that choice is rotation. A world-to-local matrix in native nodes
+# is three dot products and an Append before the box test even begins; a
+# centre/extent pair is a Subtract, an Abs and a Subtract. So the volumes are
+# treated as AXIS-ALIGNED, and a rotated clip box cuts its bounding box. The
+# C++ still publishes the matrix rows for when that is added back - see
+# README.md and Shaders/Private/BuildingClipping.ush, which hold the rotated
+# maths.
+#
+# The other cost is that the collection layout is now duplicated into every
 # injected material, so changing MAX_CLIP_VOLUMES or the parameter names means
 # re-running the injector over everything rather than editing one asset.
 # _remove_existing_clip_nodes exists to make that re-run safe.
@@ -65,8 +89,6 @@ GHOST_NAME = "ClipGhost"
 
 ASSET_PATH = "/Game/BuildingVisualization"
 MPC_NAME = "MPC_BuildingClip"
-
-INCLUDE_PATH = "/BuildingVisualization/Private/BuildingClipping.ush"
 
 # Stamped into every node this script creates, so a re-run can find and remove
 # the previous generation instead of stacking a second copy on top of it.
@@ -101,15 +123,14 @@ def _param_names():
         names.append("{}Row1_{}".format(CLIP_PREFIX, i))
         names.append("{}Row2_{}".format(CLIP_PREFIX, i))
         names.append("{}Params_{}".format(CLIP_PREFIX, i))
+        # What the material graph actually reads. Row0..Params describe the
+        # same box as a matrix and are written but not yet consumed.
+        names.append("{}Center_{}".format(CLIP_PREFIX, i))
+        names.append("{}Extent_{}".format(CLIP_PREFIX, i))
     names.append(GLOBALS_NAME)
     names.append(FOCUS_SLAB_NAME)
     names.append(GHOST_NAME)
     return names
-
-
-def _hlsl_identifier(param_name):
-    """ClipRow0_2 -> Row0_2, ClipGlobals -> Globals, ClipGhost -> Ghost."""
-    return param_name[len(CLIP_PREFIX):]
 
 
 # ---------------------------------------------------------------------------
@@ -163,40 +184,14 @@ def create_assets():
 # Injection
 # ---------------------------------------------------------------------------
 
-def _custom_node_code():
-    """
-    The Custom node body: one call into the .ush, every parameter explicit.
-
-    The maths lives in the .ush rather than in this string so it is
-    version-controlled, diffable and editable without touching any asset. A
-    long HLSL blob living inside a .uasset is effectively unreviewable.
-
-    ScreenUV for the ghost stipple arrives as an explicit INPUT, wired from a
-    ScreenPosition node. It is emphatically NOT read from the Custom node's
-    implicit Parameters struct: Parameters.SvPosition exists only in the
-    pixel-shader parameter struct, and a material is translated for several
-    stages including the vertex shader, so touching it implicitly makes the
-    node valid in some permutations and not others. A ScreenPosition node is
-    translated correctly for whichever stage is being generated.
-    """
-    args = []
-    for i in range(MAX_CLIP_VOLUMES):
-        args.extend([
-            "Row0_{}".format(i), "Row1_{}".format(i),
-            "Row2_{}".format(i), "Params_{}".format(i),
-        ])
-    return ("return BuildingClip_Evaluate(WorldPos, {}, Globals, FocusSlab, Ghost, "
-            "ScreenUV);".format(", ".join(args)))
-
-
 def _remove_existing_clip_nodes(material):
     """
     Deletes every node a previous run of this script created.
 
-    Without this, re-running would leave the old Custom node and its twenty
-    collection parameters orphaned in the graph - harmless to the compiled
-    shader, since nothing reads them, but it makes the material unreadable
-    after a few iterations and grows the asset every time.
+    Without this, re-running would leave a hundred orphaned nodes in the graph -
+    harmless to the compiled shader, since nothing reads them, but it makes the
+    material unreadable after a couple of iterations and grows the asset every
+    time. At ~100 nodes per injection this is not optional housekeeping.
 
     Returns how many were removed.
     """
@@ -209,9 +204,9 @@ def _remove_existing_clip_nodes(material):
         except Exception:
             pass
 
-        # Also sweep up the previous architecture's leftovers: a call to the
-        # old MF_BuildingClip, or a call whose function has gone null because
-        # that asset was deleted. Both are inert, but a null function call is
+        # Also sweep up the previous architectures' leftovers: a call to the old
+        # MF_BuildingClip, or a call whose function has gone null because that
+        # asset was deleted. Both are inert, but a null function call is
         # indistinguishable from a working one at a glance, which makes it
         # exactly the kind of thing that wastes an afternoon.
         if isinstance(expr, unreal.MaterialExpressionMaterialFunctionCall):
@@ -219,15 +214,291 @@ def _remove_existing_clip_nodes(material):
             if fn is None or fn.get_name() == "MF_BuildingClip":
                 doomed.append(expr)
 
+        # And the Custom node generation, in case its desc tag was lost - the
+        # node uses "description" for its generated HLSL function name, which
+        # is easy to confuse with the "desc" the tag lives in.
+        elif isinstance(expr, unreal.MaterialExpressionCustom):
+            if expr.get_editor_property("description") == "BuildingClip":
+                doomed.append(expr)
+
     for expr in doomed:
         _mel.delete_material_expression(material, expr)
     return len(doomed)
 
 
-def _tag(expr):
-    """Marks a node as ours so a later run can clean it up."""
-    expr.set_editor_property("desc", CLIP_NODE_TAG)
-    return expr
+# ---------------------------------------------------------------------------
+# Native node graph construction
+# ---------------------------------------------------------------------------
+#
+# Every node built below is tagged and positioned. The positions matter: a
+# hundred untagged nodes piled at the origin is not a graph anyone can debug,
+# and the whole reason this generation exists is that the previous one could
+# not be inspected.
+
+class _Builder(object):
+    """Creates tagged, positioned nodes in one material."""
+
+    def __init__(self, material, collection):
+        self.material = material
+        self.collection = collection
+        self.count = 0
+
+    def node(self, cls, x, y):
+        expr = _mel.create_material_expression(self.material, cls, x, y)
+        expr.set_editor_property("desc", CLIP_NODE_TAG)
+        self.count += 1
+        return expr
+
+    def param(self, name, x, y):
+        expr = self.node(unreal.MaterialExpressionCollectionParameter, x, y)
+        expr.set_editor_property("collection", self.collection)
+        expr.set_editor_property("parameter_name", name)
+        return expr
+
+    def mask(self, src, channels, x, y, src_out=""):
+        """ComponentMask. channels is a string like "rgb", "b" or "a"."""
+        expr = self.node(unreal.MaterialExpressionComponentMask, x, y)
+        for channel in "rgba":
+            expr.set_editor_property(channel, channel in channels)
+        _connect(src, src_out, expr, "", "mask .{}".format(channels))
+        return expr
+
+    def unary(self, cls, src, x, y, what):
+        expr = self.node(cls, x, y)
+        _connect(src, "", expr, "", what)
+        return expr
+
+    def binary(self, cls, a, b, x, y, what):
+        expr = self.node(cls, x, y)
+        _connect(a, "", expr, "A", what + " (A)")
+        _connect(b, "", expr, "B", what + " (B)")
+        return expr
+
+    def binary_const(self, cls, a, const_b, x, y, what):
+        """Binary op with B left as a literal. Saves a Constant node each time."""
+        expr = self.node(cls, x, y)
+        _connect(a, "", expr, "A", what + " (A)")
+        expr.set_editor_property("const_b", const_b)
+        return expr
+
+    def constant(self, value, x, y):
+        expr = self.node(unreal.MaterialExpressionConstant, x, y)
+        expr.set_editor_property("r", value)
+        return expr
+
+    def select_on_mode(self, mode, when_cut_outside, otherwise, x, y, what):
+        """
+        If(mode >= 1.5, when_cut_outside, otherwise).
+
+        1.5 rather than 2 so no float comparison lands on the boundary, and
+        A == B is deliberately left unconnected - with no equals pin the
+        translator emits a plain two-way select, which is what is wanted.
+        """
+        expr = self.node(unreal.MaterialExpressionIf, x, y)
+        expr.set_editor_property("const_b", 1.5)
+        _connect(mode, "", expr, "A", what + " (mode)")
+        _connect(when_cut_outside, "", expr, "A > B", what + " (cut outside)")
+        _connect(otherwise, "", expr, "A < B", what + " (other modes)")
+        return expr
+
+    def reduce(self, cls, nodes, x, y, what):
+        """Pairwise tree rather than a chain: shorter, and it reads as a tree."""
+        row = 0
+        while len(nodes) > 1:
+            merged = []
+            for i in range(0, len(nodes) - 1, 2):
+                merged.append(self.binary(cls, nodes[i], nodes[i + 1],
+                                          x + row * 200, y + i * 300, what))
+            if len(nodes) % 2:
+                merged.append(nodes[-1])
+            nodes = merged
+            row += 1
+        return nodes[0]
+
+
+def _build_volume_keep(b, index, world_pos, feather, one, zero, x, y):
+    """
+    Evaluates one volume into the three terms the combiner needs.
+
+    The maths is the standard axis-aligned box test written out as nodes:
+
+        q       = abs(worldPos - centre) - extent     // negative on every axis = inside
+        outside = saturate(max(q.x, q.y, q.z) / feather)
+
+    outside is 0 well inside the box, 1 well outside it, and ramps across
+    `feather` world units at the surface. Dividing by the feather rather than
+    comparing against zero is what stops the cut edge crawling with pixel-sized
+    stair steps when a wall is viewed at a glancing angle.
+
+    The mode then picks which way round that means, and - this is the part that
+    is not obvious - the two modes must be combined differently, so they go to
+    different accumulators rather than to one keep value:
+
+        Cut Inside  is SUBTRACTIVE. Each removes its own contents, so a pixel
+                    must survive all of them -> the cut terms combine with min.
+        Cut Outside is RESTRICTIVE. Each keeps only its contents, so a pixel
+                    inside ANY of them survives -> the isolate terms combine
+                    with max.
+
+    Collapsing both into one keep value and taking the min looks like it works,
+    because the common case is a single isolation. It fails the moment there are
+    two: isolating the pipes and the HVAC would show their empty intersection -
+    nothing at all - rather than both systems.
+
+    So this returns (cut, isolate, isolateFlag):
+
+        cut         = 1 for a Cut Outside volume (it subtracts nothing),
+                      else `outside`
+        isolate     = `1 - outside` for a Cut Outside volume, else 0
+        isolateFlag = 1 for a Cut Outside volume, else 0, so the combiner can
+                      tell "no isolation requested" from "isolation that keeps
+                      nothing here"
+
+    Mode 0 (Disabled) lands in the non-Cut-Outside branch, which is correct for
+    free: the C++ never packs a disabled volume, so an unused slot arrives as
+    centre 0 / extent 0, a zero-sized box every pixel is outside of. `outside`
+    is therefore 1 and the slot cuts nothing. No branch, no special case, no
+    wasted parameter.
+    """
+    cen = b.param("{}Center_{}".format(CLIP_PREFIX, index), x, y)
+    ext = b.param("{}Extent_{}".format(CLIP_PREFIX, index), x, y + 80)
+
+    cen_xyz = b.mask(cen, "rgb", x + 200, y)
+    ext_xyz = b.mask(ext, "rgb", x + 200, y + 80)
+    mode = b.mask(cen, "a", x + 200, y + 160)
+
+    delta = b.binary(unreal.MaterialExpressionSubtract, world_pos, cen_xyz,
+                     x + 400, y, "volume {} worldPos - centre".format(index))
+    adelta = b.unary(unreal.MaterialExpressionAbs, delta,
+                     x + 560, y, "volume {} abs".format(index))
+    q = b.binary(unreal.MaterialExpressionSubtract, adelta, ext_xyz,
+                 x + 700, y, "volume {} - extent".format(index))
+
+    # A material graph has no component-wise reduce, so the max over the three
+    # axes is three masks and two Max nodes. This is the price of native nodes
+    # over one line of HLSL, and it is worth paying for a graph that can be
+    # read in the editor.
+    qx = b.mask(q, "r", x + 860, y - 60)
+    qy = b.mask(q, "g", x + 860, y + 20)
+    qz = b.mask(q, "b", x + 860, y + 100)
+    m1 = b.binary(unreal.MaterialExpressionMax, qx, qy,
+                  x + 1020, y - 20, "volume {} max xy".format(index))
+    m2 = b.binary(unreal.MaterialExpressionMax, m1, qz,
+                  x + 1160, y + 20, "volume {} max xyz".format(index))
+
+    ratio = b.binary(unreal.MaterialExpressionDivide, m2, feather,
+                     x + 1300, y, "volume {} / feather".format(index))
+    outside = b.unary(unreal.MaterialExpressionSaturate, ratio,
+                      x + 1440, y, "volume {} saturate".format(index))
+    inside = b.unary(unreal.MaterialExpressionOneMinus, outside,
+                     x + 1440, y + 80, "volume {} invert".format(index))
+
+    cut = b.select_on_mode(mode, one, outside, x + 1600, y - 80,
+                           "volume {} cut term".format(index))
+    isolate = b.select_on_mode(mode, inside, zero, x + 1600, y + 40,
+                               "volume {} isolate term".format(index))
+    flag = b.select_on_mode(mode, one, zero, x + 1600, y + 160,
+                            "volume {} isolate flag".format(index))
+    return cut, isolate, flag
+
+
+def _build_focus_slab(b, world_pos, x, y):
+    """
+    The SelectFloor term: 1 inside the focused storey, 0 outside it.
+
+    A floor is a Z range, so this is two feathered one-sided tests multiplied
+    together - no per-object data and no bounds test, which is why selecting a
+    floor costs one vector however large the building is.
+
+    ClipFocusSlab is (minZ, maxZ, active, feather). With nothing selected,
+    active is 0 and the Lerp returns a constant 1, so the whole term drops out
+    rather than every pixel testing against a garbage Z range.
+    """
+    slab = b.param(FOCUS_SLAB_NAME, x, y)
+    min_z = b.mask(slab, "r", x + 200, y - 80)
+    max_z = b.mask(slab, "g", x + 200, y)
+    active = b.mask(slab, "b", x + 200, y + 80)
+    slab_feather = b.mask(slab, "a", x + 200, y + 160)
+
+    # Guarded for the same reason as the clip feather below: a zero here is a
+    # divide by zero, and the NaN propagates to the opacity mask and erases the
+    # whole material rather than failing visibly in one place.
+    safe_feather = b.binary_const(unreal.MaterialExpressionMax, slab_feather, 0.01,
+                                  x + 360, y + 160, "slab feather guard")
+
+    wz = b.mask(world_pos, "b", x + 360, y - 160)
+
+    above = b.binary(unreal.MaterialExpressionSubtract, wz, min_z,
+                     x + 520, y - 120, "worldZ - minZ")
+    above_r = b.binary(unreal.MaterialExpressionDivide, above, safe_feather,
+                       x + 660, y - 120, "above / feather")
+    above_s = b.unary(unreal.MaterialExpressionSaturate, above_r,
+                      x + 800, y - 120, "above saturate")
+
+    below = b.binary(unreal.MaterialExpressionSubtract, max_z, wz,
+                     x + 520, y + 40, "maxZ - worldZ")
+    below_r = b.binary(unreal.MaterialExpressionDivide, below, safe_feather,
+                       x + 660, y + 40, "below / feather")
+    below_s = b.unary(unreal.MaterialExpressionSaturate, below_r,
+                      x + 800, y + 40, "below saturate")
+
+    in_slab = b.binary(unreal.MaterialExpressionMultiply, above_s, below_s,
+                       x + 940, y - 40, "in slab")
+
+    keep = b.node(unreal.MaterialExpressionLinearInterpolate, x + 1100, y)
+    keep.set_editor_property("const_a", 1.0)          # slab off -> keep everything
+    _connect(in_slab, "", keep, "B", "slab on -> slab test")
+    _connect(active, "", keep, "Alpha", "slab active")
+    return keep
+
+
+def _build_ghost(b, x, y):
+    """
+    The stipple that lets out-of-focus geometry survive at reduced density.
+
+    The material is Masked, not Translucent, so there is no real alpha to fade
+    with - a pixel is drawn or it is not. Ghosting is therefore a screen-space
+    dither: keep a pixel when its noise value falls under the ghost opacity, so
+    15% opacity means 15% of pixels survive and the wall reads as a haze.
+
+    Interleaved gradient noise rather than a texture lookup or a Bayer matrix:
+    four instructions, no sampler, and its high-frequency distribution is what
+    TAA resolves into an even tone instead of a crawling pattern.
+
+    Returns a mask that is 0 everywhere when ghosting is off, so the caller can
+    max() it into the focus term unconditionally.
+    """
+    ghost = b.param(GHOST_NAME, x, y)
+    opacity = b.mask(ghost, "r", x + 200, y)
+    enabled = b.mask(ghost, "g", x + 200, y + 80)
+
+    screen = b.node(unreal.MaterialExpressionScreenPosition, x, y + 200)
+    magic = b.node(unreal.MaterialExpressionConstant2Vector, x, y + 300)
+    magic.set_editor_property("r", 0.06711056)
+    magic.set_editor_property("g", 0.00583715)
+
+    # PixelPosition, not ViewportUV. The dither has to be locked to the pixel
+    # grid or it swims across the surface as the camera moves, which is far
+    # more distracting than the ghosting itself.
+    dot = b.node(unreal.MaterialExpressionDotProduct, x + 200, y + 240)
+    _connect(screen, "PixelPosition", dot, "A", "screen pixel position")
+    _connect(magic, "", dot, "B", "IGN constants")
+
+    f1 = b.unary(unreal.MaterialExpressionFrac, dot, x + 360, y + 240, "IGN frac 1")
+    scaled = b.binary_const(unreal.MaterialExpressionMultiply, f1, 52.9829189,
+                            x + 500, y + 240, "IGN scale")
+    noise = b.unary(unreal.MaterialExpressionFrac, scaled, x + 640, y + 240, "IGN frac 2")
+
+    # ceil(saturate(opacity - noise)) is 1 where the pixel survives and 0 where
+    # it does not. Saturate first, or a negative difference ceils to 0 by luck
+    # rather than by construction.
+    diff = b.binary(unreal.MaterialExpressionSubtract, opacity, noise,
+                    x + 800, y + 120, "opacity - noise")
+    clamped = b.unary(unreal.MaterialExpressionSaturate, diff, x + 940, y + 120, "ghost saturate")
+    stipple = b.unary(unreal.MaterialExpressionCeil, clamped, x + 1080, y + 120, "ghost step")
+
+    return b.binary(unreal.MaterialExpressionMultiply, stipple, enabled,
+                    x + 1220, y + 120, "ghost gate")
 
 
 def inject_into_material(material, collection):
@@ -275,41 +546,63 @@ def inject_into_material(material, collection):
 
     removed = _remove_existing_clip_nodes(material)
 
-    # The Custom node. Its description becomes the generated HLSL function
-    # name, which makes the compiled shader readable when something goes wrong.
-    custom = _tag(_mel.create_material_expression(
-        material, unreal.MaterialExpressionCustom, -900, 400))
-    custom.set_editor_property("code", _custom_node_code())
-    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT1)
-    custom.set_editor_property("description", "BuildingClip")
-    custom.set_editor_property("include_file_paths", [INCLUDE_PATH])
+    b = _Builder(material, collection)
 
-    # Inputs, in the order the generated HLSL expects.
-    inputs = [
-        ("WorldPos", _tag(_mel.create_material_expression(
-            material, unreal.MaterialExpressionWorldPosition, -1400, 240))),
-        ("ScreenUV", _tag(_mel.create_material_expression(
-            material, unreal.MaterialExpressionScreenPosition, -1400, 300))),
-    ]
+    # Shared inputs. One WorldPosition node feeds every volume and the slab -
+    # the translator would collapse duplicates anyway, but one node is also one
+    # thing to check when the cut lands in the wrong place.
+    world_pos = b.node(unreal.MaterialExpressionWorldPosition, -3600, -900)
+    globals_p = b.param(GLOBALS_NAME, -3600, -800)
+    feather_raw = b.mask(globals_p, "g", -3400, -800)
 
-    y = 380
-    for name in _param_names():
-        node = _tag(_mel.create_material_expression(
-            material, unreal.MaterialExpressionCollectionParameter, -1400, y))
-        node.set_editor_property("collection", collection)
-        node.set_editor_property("parameter_name", name)
-        inputs.append((_hlsl_identifier(name), node))
-        y += 60
+    # Guarded against zero. The collection defaults to all zeros, and there is
+    # a window on load between a material compiling and the subsystem's first
+    # push where the feather really is 0 - unguarded, that is a divide by zero
+    # whose NaN reaches the opacity mask and blanks the entire building.
+    feather = b.binary_const(unreal.MaterialExpressionMax, feather_raw, 0.01,
+                             -3240, -800, "clip feather guard")
 
-    custom_inputs = []
-    for ident, _node in inputs:
-        entry = unreal.CustomInput()
-        entry.set_editor_property("input_name", ident)
-        custom_inputs.append(entry)
-    custom.set_editor_property("inputs", custom_inputs)
+    # Two literals, shared by every volume's mode select. A Constant per volume
+    # would be twelve more nodes saying the same thing.
+    one = b.constant(1.0, -3400, -650)
+    zero = b.constant(0.0, -3400, -580)
 
-    for ident, node in inputs:
-        _connect(node, "", custom, ident, "{} -> custom.{}".format(node.get_name(), ident))
+    terms = [_build_volume_keep(b, i, world_pos, feather, one, zero, -3000, i * 420)
+             for i in range(MAX_CLIP_VOLUMES)]
+    cuts = [t[0] for t in terms]
+    isolates = [t[1] for t in terms]
+    flags = [t[2] for t in terms]
+
+    # Cuts intersect on keep (a pixel must survive every subtractive box);
+    # isolations union (a pixel inside ANY restrictive box survives). Standard
+    # CSG, and the asymmetry is the whole reason the two are tracked apart.
+    cut_keep = b.reduce(unreal.MaterialExpressionMin, cuts, -1100, 0, "combine cuts")
+    isolate_keep = b.reduce(unreal.MaterialExpressionMax, isolates, -1100, 1200, "combine isolations")
+    any_isolate = b.reduce(unreal.MaterialExpressionMax, flags, -1100, 2400, "any isolation")
+
+    # With no isolation volume present, isolate_keep is 0 everywhere, which
+    # would erase the building. The flag is what distinguishes "nothing is
+    # isolated" from "the isolation keeps nothing here".
+    isolate_term = b.node(unreal.MaterialExpressionLinearInterpolate, -700, 1800)
+    isolate_term.set_editor_property("const_a", 1.0)
+    _connect(isolate_keep, "", isolate_term, "B", "isolation keep")
+    _connect(any_isolate, "", isolate_term, "Alpha", "isolation present")
+
+    clip_keep = b.binary(unreal.MaterialExpressionMin, cut_keep, isolate_term,
+                         -500, 900, "cuts and isolations")
+
+    slab_keep = _build_focus_slab(b, world_pos, -3000, 1900)
+    ghost_floor = _build_ghost(b, -3000, 2500)
+
+    # Max, not Multiply: ghosting must ADD survivors back to the out-of-focus
+    # region, not remove more. It is deliberately applied only to the focus
+    # term - a clip box is an explicit "remove this", and having it fade to a
+    # haze instead of cutting would make the inspection cube useless.
+    focus_term = b.binary(unreal.MaterialExpressionMax, slab_keep, ghost_floor,
+                          -1400, 2200, "focus or ghost")
+
+    final = b.binary(unreal.MaterialExpressionMin, clip_keep, focus_term,
+                     -800, 600, "clip and focus")
 
     # BLEND MODE MUST BE SET BEFORE CONNECTING THE OPACITY MASK.
     #
@@ -322,27 +615,20 @@ def inject_into_material(material, collection):
     #
     # Setting Masked afterwards does not retroactively make the stored
     # connection live. It has to be Masked at the moment the connection is made.
-    #
-    # Diagnosed by wiring the Custom node to return a literal 0.0 - which should
-    # have erased every surface - and watching the building render perfectly
-    # intact, while a base-colour change on the same material turned it red
-    # instantly. Same material, same recompile, one edit visible and the other
-    # inert: that is what pointed at the property rather than at the graph.
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
 
     if existing_mask is not None:
-        mult = _tag(_mel.create_material_expression(
-            material, unreal.MaterialExpressionMultiply, -600, 400))
-        _connect(custom, "", mult, "B", "clip mask -> multiply B")
-        _connect(existing_mask, "", mult, "A", "existing mask -> multiply A")
+        mult = b.binary(unreal.MaterialExpressionMultiply, existing_mask, final,
+                        -400, 600, "existing mask * clip")
         _mel.connect_material_property(mult, "", unreal.MaterialProperty.MP_OPACITY_MASK)
     else:
-        _mel.connect_material_property(custom, "", unreal.MaterialProperty.MP_OPACITY_MASK)
+        _mel.connect_material_property(final, "", unreal.MaterialProperty.MP_OPACITY_MASK)
 
     _mel.recompile_material(material)
 
-    if removed:
-        _log("Replaced {} previously generated node(s) in {}.".format(removed, material.get_name()))
+    _log("Injected {} node(s) into {}{}.".format(
+        b.count, material.get_name(),
+        " (replaced {} previously generated)".format(removed) if removed else ""))
     return True
 
 

@@ -129,6 +129,21 @@ void AClippingVolumeActor::SetClipMode(EBuildingClipMode NewMode)
 	}
 }
 
+FVector AClippingVolumeActor::GetWorldCenter() const
+{
+	return BoxComponent ? BoxComponent->GetComponentLocation() : GetActorLocation();
+}
+
+FVector AClippingVolumeActor::GetWorldExtent() const
+{
+	// Scaled, unlike the matrix path which keeps extents unscaled and lets the
+	// matrix carry the scale. Here there is no matrix, so the extent has to be
+	// the real world size or the box tested would be the wrong size - which is
+	// precisely the class of mismatch that made the previous version fail
+	// silently.
+	return BoxComponent ? BoxComponent->GetScaledBoxExtent() : FVector::ZeroVector;
+}
+
 FBuildingClipVolumeGPU AClippingVolumeActor::BuildGPUData() const
 {
 	FBuildingClipVolumeGPU Out;
@@ -164,6 +179,21 @@ FBuildingClipVolumeGPU AClippingVolumeActor::BuildGPUData() const
 		static_cast<float>(Extents.Y),
 		static_cast<float>(Extents.Z),
 		static_cast<float>(static_cast<uint8>(ClipMode)));
+
+	// The axis-aligned pair the material graph actually reads. Scaled extents
+	// here, unscaled above - see GetWorldExtent for why the two differ.
+	const FVector Centre = GetWorldCenter();
+	const FVector WorldExtent = GetWorldExtent();
+	Out.Center = FVector4f(
+		static_cast<float>(Centre.X),
+		static_cast<float>(Centre.Y),
+		static_cast<float>(Centre.Z),
+		static_cast<float>(static_cast<uint8>(ClipMode)));
+	Out.Extent = FVector4f(
+		static_cast<float>(WorldExtent.X),
+		static_cast<float>(WorldExtent.Y),
+		static_cast<float>(WorldExtent.Z),
+		0.0f);
 
 	return Out;
 }

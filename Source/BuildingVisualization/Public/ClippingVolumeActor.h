@@ -47,6 +47,24 @@ public:
 	/** Packs this volume into the form the shader consumes. */
 	FBuildingClipVolumeGPU BuildGPUData() const;
 
+	/**
+	 * World-space centre and half-extents of the box.
+	 *
+	 * Published alongside the matrix because the material graph is built from
+	 * NATIVE nodes rather than a Custom node, and a centre/extent pair is three
+	 * subtractions and an abs in native nodes, whereas a world-to-local matrix
+	 * needs three dot products and an append just to get started.
+	 *
+	 * The cost is that this pair describes an AXIS-ALIGNED box only - rotation
+	 * is dropped. That is a deliberate trade for a graph that can be built
+	 * reliably; the matrix is still published for when rotation is added back.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Clipping")
+	FVector GetWorldCenter() const;
+
+	UFUNCTION(BlueprintPure, Category = "Clipping")
+	FVector GetWorldExtent() const;
+
 	/** What this volume does to geometry it covers. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Clipping")
 	EBuildingClipMode ClipMode = EBuildingClipMode::CutInside;

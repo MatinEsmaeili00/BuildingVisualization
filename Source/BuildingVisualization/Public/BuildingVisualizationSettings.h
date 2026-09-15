@@ -39,8 +39,9 @@ public:
 	 * carrying their own copies of these parameters - would mean touching
 	 * thousands of objects each time the box moves.
 	 *
-	 * Create it with Generate Parameter Collection (see Docs/03-setup.md), or
-	 * run the Python setup script which creates it with the right layout.
+	 * Create it with Generate Parameter Collection, or run the Python setup
+	 * script, which creates it with the right layout - see the Setup section
+	 * of README.md.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Material Bridge", meta = (AllowedClasses = "/Script/Engine.MaterialParameterCollection"))
 	TSoftObjectPtr<UMaterialParameterCollection> ParameterCollection;

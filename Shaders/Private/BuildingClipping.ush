@@ -2,9 +2,24 @@
 //
 // Spatial clipping for building geometry.
 //
-// Included by the generated material function MF_BuildingClip through a Custom
-// node, so this code ends up compiled into every clippable material. Keep it
-// cheap: it runs per pixel, on every surface in the building, every frame.
+// NOTHING INCLUDES THIS FILE TODAY. It is kept deliberately, and it is not
+// stale - read on before deleting it.
+//
+// The shipped path builds the clip test from native material nodes, because a
+// Custom node's named inputs turned out to be the one link in the chain that
+// could not be verified from outside the material (see the README). Native
+// nodes cost rotation: a centre/extent pair is three nodes to test, whereas a
+// world-to-local matrix is three dot products and an append, so the graph
+// treats every volume as axis-aligned.
+//
+// This file is the rotated implementation. The C++ still publishes the matrix
+// rows every frame, so restoring oriented boxes is a matter of consuming them -
+// either by re-adding a Custom node with this include, or by open-coding the
+// three dot products in the injector. Deleting it would mean rederiving the
+// SDF, the CSG composition rules and the dither from scratch.
+//
+// Keep it cheap if it is ever switched back on: it runs per pixel, on every
+// surface in the building, every frame.
 //
 // The contract with the CPU side (BuildingVisualizationSubsystem) is the
 // packing of the four vectors per volume:

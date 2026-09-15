@@ -20,7 +20,7 @@ namespace BuildingVisualization
 	 * Raising this means regenerating the MPC and reinjecting the material
 	 * function. If you ever need dozens, the answer is not a bigger number
 	 * here - it is a structured buffer and a custom vertex factory, which is a
-	 * different and much larger piece of work. See Docs/02-clipping-maths.md.
+	 * different and much larger piece of work. See the Cost section of README.md.
 	 */
 	static constexpr int32 MaxClipVolumes = 4;
 }
@@ -61,4 +61,25 @@ struct FBuildingClipVolumeGPU
 
 	/** XYZ = half-extents in local space. W = EBuildingClipMode as a float. */
 	FVector4f Params = FVector4f(0.f, 0.f, 0.f, 0.f);
+
+	/**
+	 * The same box again, as a world-space axis-aligned centre and half-extent.
+	 *
+	 * Redundant with the matrix above, and deliberately so. The matrix form is
+	 * the correct one - it handles rotation - but expressing it in a material
+	 * graph means three dot products and an Append before the test even starts,
+	 * built out of nodes wired up by a script. The centre/extent form is a
+	 * Subtract, an Abs and a Subtract, which is small enough to build reliably
+	 * and small enough to read in the material editor when it misbehaves.
+	 *
+	 * So the shader uses this pair and ignores rotation; the matrix stays
+	 * published for when the rotated path is added back. Two float4s of
+	 * collection space per volume is a cheap price for a graph that can be
+	 * verified by looking at it.
+	 *
+	 * Center.W carries the mode, so a material reads one vector and knows both
+	 * where the box is and what it does.
+	 */
+	FVector4f Center = FVector4f(0.f, 0.f, 0.f, 0.f);
+	FVector4f Extent = FVector4f(0.f, 0.f, 0.f, 0.f);
 };

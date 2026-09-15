@@ -37,12 +37,16 @@ void UBuildingVisualizationSubsystem::Initialize(FSubsystemCollectionBase& Colle
 	Row1Names.Reserve(BuildingVisualization::MaxClipVolumes);
 	Row2Names.Reserve(BuildingVisualization::MaxClipVolumes);
 	ParamNames.Reserve(BuildingVisualization::MaxClipVolumes);
+	CenterNames.Reserve(BuildingVisualization::MaxClipVolumes);
+	ExtentNames.Reserve(BuildingVisualization::MaxClipVolumes);
 	for (int32 Index = 0; Index < BuildingVisualization::MaxClipVolumes; ++Index)
 	{
 		Row0Names.Add(FName(*FString::Printf(TEXT("%sRow0_%d"), *Prefix, Index)));
 		Row1Names.Add(FName(*FString::Printf(TEXT("%sRow1_%d"), *Prefix, Index)));
 		Row2Names.Add(FName(*FString::Printf(TEXT("%sRow2_%d"), *Prefix, Index)));
 		ParamNames.Add(FName(*FString::Printf(TEXT("%sParams_%d"), *Prefix, Index)));
+		CenterNames.Add(FName(*FString::Printf(TEXT("%sCenter_%d"), *Prefix, Index)));
+		ExtentNames.Add(FName(*FString::Printf(TEXT("%sExtent_%d"), *Prefix, Index)));
 	}
 
 	if (!Settings.ParameterCollection.IsNull())
@@ -83,6 +87,8 @@ void UBuildingVisualizationSubsystem::Initialize(FSubsystemCollectionBase& Colle
 		CheckName(Row1Names[Index]);
 		CheckName(Row2Names[Index]);
 		CheckName(ParamNames[Index]);
+		CheckName(CenterNames[Index]);
+		CheckName(ExtentNames[Index]);
 	}
 	CheckName(GlobalsName);
 	CheckName(FocusSlabName);
@@ -368,6 +374,29 @@ void UBuildingVisualizationSubsystem::LogStatus() const
 	UE_LOG(LogBuildingVisualization, Display, TEXT("  Clip volumes     : %d registered, %d active, %d slots"),
 		LiveVolumes, ActiveVolumes, BuildingVisualization::MaxClipVolumes);
 
+	// Listed individually, because "1 active" and "1 active in the right place
+	// and the right size" are very different states that look identical from a
+	// count. Printing exactly the numbers the material reads means a wrong cut
+	// can be diagnosed against the viewport without opening the material.
+	for (const TWeakObjectPtr<AClippingVolumeActor>& Weak : RegisteredVolumes)
+	{
+		const AClippingVolumeActor* Volume = Weak.Get();
+		if (!Volume)
+		{
+			continue;
+		}
+
+		const FVector C = Volume->GetWorldCenter();
+		const FVector E = Volume->GetWorldExtent();
+		const TCHAR* ModeText =
+			Volume->ClipMode == EBuildingClipMode::CutInside ? TEXT("Cut Inside") :
+			Volume->ClipMode == EBuildingClipMode::CutOutside ? TEXT("Cut Outside") : TEXT("Disabled");
+
+		UE_LOG(LogBuildingVisualization, Display,
+			TEXT("    - %-24s %-11s centre (%.0f, %.0f, %.0f) extent (%.0f, %.0f, %.0f) priority %d"),
+			*Volume->GetName(), ModeText, C.X, C.Y, C.Z, E.X, E.Y, E.Z, Volume->Priority);
+	}
+
 	if (bFocusSlabActive)
 	{
 		UE_LOG(LogBuildingVisualization, Display, TEXT("  Focus slab       : Z %.1f .. %.1f (feather %.1f)"),
@@ -497,6 +526,16 @@ void UBuildingVisualizationSubsystem::PushClipParameters()
 			static_cast<float>(Extent.Y),
 			static_cast<float>(Extent.Z),
 			static_cast<float>(static_cast<uint8>(EBuildingClipMode::CutOutside)));
+		Isolation.Center = FVector4f(
+			static_cast<float>(Centre.X),
+			static_cast<float>(Centre.Y),
+			static_cast<float>(Centre.Z),
+			static_cast<float>(static_cast<uint8>(EBuildingClipMode::CutOutside)));
+		Isolation.Extent = FVector4f(
+			static_cast<float>(Extent.X),
+			static_cast<float>(Extent.Y),
+			static_cast<float>(Extent.Z),
+			0.0f);
 		Packed.Add(Isolation);
 	}
 
@@ -533,6 +572,12 @@ void UBuildingVisualizationSubsystem::PushClipParameters()
 		UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, Row1Names[Index], ToColor(Data.Row1));
 		UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, Row2Names[Index], ToColor(Data.Row2));
 		UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, ParamNames[Index], ToColor(Data.Params));
+
+		// What the material graph reads. The three rows above are still pushed
+		// because they cost nothing to write and the rotated path will want
+		// them, but nothing consumes them today.
+		UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, CenterNames[Index], ToColor(Data.Center));
+		UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, ExtentNames[Index], ToColor(Data.Extent));
 	}
 
 	UKismetMaterialLibrary::SetVectorParameterValue(this, ParameterCollection, GlobalsName,

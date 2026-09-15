@@ -9,9 +9,20 @@ swapped, duplicated, or iterated over — the GPU does the spatial test per pixe
 and the CPU cost is proportional to the number of clip volumes, not the number
 of objects in the building.
 
-> **Status: in development.** Increment 1 (clip volumes, global parameters,
-> world-space box clipping) is implemented and verified to compile. Selection,
-> ghosting and capped cross-sections are in progress — see [Roadmap](#roadmap).
+| `BV.Clip 1` | `BV.Clip 0` |
+|---|---|
+| ![clipping on](Docs/clipping-on.png) | ![clipping off](Docs/clipping-off.png) |
+
+The blue wireframe is the Clipping Volume actor. Nothing about the wall, the
+cylinder or the floor was touched — they share the building's materials, and
+the cut is decided per pixel from one global parameter buffer.
+
+> **Status: working.** Clip volumes, floor selection, room/system isolation and
+> dithered ghosting are implemented and verified cutting geometry in the editor
+> viewport. Clip volumes are **axis-aligned** — rotation is published by the C++
+> but not yet consumed by the graph, see
+> [Axis-aligned, for now](#axis-aligned-for-now). Capped cross-sections are next
+> — see [Roadmap](#roadmap).
 
 ---
 
@@ -40,15 +51,14 @@ frame by a single subsystem.
 AClippingVolumeActor ──┐
 AClippingVolumeActor ──┼──► UBuildingVisualizationSubsystem
 AClippingVolumeActor ──┘         │
-                                 │  writes 17 vectors, only when something changed
+                                 │  writes 27 vectors, only when something changed
                                  ▼
                     MPC_BuildingClip  (Material Parameter Collection)
                                  │
                                  │  read by
                                  ▼
-                       MF_BuildingClip  (material function)
+              ~100 native material nodes, built by the injector
                                  │
-                                 │  injected once per material, by script
                                  ▼
                   every clippable material → Opacity Mask
 ```
@@ -100,75 +110,168 @@ looking at it.
 Material-**level** graph building through the same API works reliably, so the
 whole node group is built directly in each material instead. The compiled
 shader is identical either way — a material function is inlined at compile time
-regardless — so the only cost is ~21 nodes per material at injection time.
+regardless — so the only cost is nodes at injection time.
 
 The real trade: the collection layout is now duplicated into every injected
 material, so changing `MaxClipVolumes` or the parameter names means re-running
 the injector rather than editing one asset. `_remove_existing_clip_nodes` makes
 that re-run safe by sweeping the previous generation first.
 
+### Why there is no Custom node either
+
+The function was then replaced by a single `Custom` node calling into
+`BuildingClipping.ush`, with the collection parameters wired in as twenty-one
+named inputs. One node per material, the maths in a diffable file. That
+compiled cleanly — and cut nothing.
+
+Everything around it verified correct, individually:
+
+| Checked | Result |
+|---|---|
+| `BV.Status` collection layout | valid |
+| Values reaching the collection | `ClipParams_0 = (200, 200, 200, 2.0)`, rows consistent with the box |
+| Collection parameters with a missing name | 0 |
+| Material blend mode / Opacity Mask pin | `MASKED`, connected to the Custom node |
+| Masking itself, in an isolated material | works |
+
+A Custom node with twenty-one inputs has exactly **one** thing that cannot be
+inspected from outside: whether each named input actually bound to the argument
+the generated HLSL expects. Everything else had been eliminated. Rather than
+keep testing the one opaque link, it was removed.
+
+So the graph is now built from **native material nodes only** — no include
+path, no HLSL string, no input binding. Around 120 nodes per material, every
+one of them visible in the material editor and every one of them something the
+material editor itself would have produced. When it misbehaves, you can look
+at it.
+
+The lesson generalises past this plugin: when a chain is long and every link
+but one has been verified, stop verifying and delete the link you cannot see
+into.
+
 ---
 
 ## How the clipping works
 
-### The volume sends a matrix, not a centre and a rotation
+### Axis-aligned, for now
 
-`AClippingVolumeActor::BuildGPUData` packs the box's **inverse world
-transform**. In the shader, a world position multiplied by that matrix lands in
-the box's local space, where the oriented-box test collapses to:
+Each volume is published twice: as a **world-to-local matrix** and as a
+**world-space centre and half-extent**. The matrix is the correct form — a
+world position multiplied by it lands in the box's local space, where an
+oriented-box test collapses to `abs(local) <= extents`, and rotation and
+non-uniform scale come along for free inside the matrix.
 
-```hlsl
-abs(local) <= extents
+The graph reads the centre/extent pair instead, because of what each form costs
+in **nodes**:
+
+| Form | In HLSL | In native material nodes |
+|---|---|---|
+| World-to-local matrix | one `mul` | 3 masks, 3 dot products, an Append — before the test starts |
+| Centre + half-extent | one subtract | Subtract → Abs → Subtract |
+
+Since the whole reason the graph is built from native nodes is that it has to
+be inspectable when it goes wrong, the cheaper form wins. The cost is that a
+**rotated clip volume cuts its bounding box**, not the rotated box.
+
+The matrix rows are still written every frame, and
+[`Shaders/Private/BuildingClipping.ush`](Shaders/Private/BuildingClipping.ush)
+still holds the oriented implementation, so restoring rotation is a matter of
+consuming what is already published — not rederiving it.
+
+### The box test
+
+```
+q       = abs(worldPos - centre) - extent      // negative on every axis = inside
+outside = saturate(max(q.x, q.y, q.z) / feather)
 ```
 
-Rotation and non-uniform scale are already inside the matrix, so they cost
-nothing extra — no quaternion, no per-axis scale, no branching on shape. This is
-why the actor can be rotated and scaled freely with the standard gizmo and the
-shader never learns about it.
+`outside` is 0 well inside the box, 1 well outside it, and ramps across
+`feather` world units at the surface. Then the mode picks which way round that
+means:
 
-### The box SDF, and why it is two terms
+| Mode | Keep mask |
+|---|---|
+| Cut Inside | `outside` |
+| Cut Outside | `1 - outside` |
+
+**Disabled costs nothing and needs no branch.** The C++ never packs a disabled
+volume, so an unused slot arrives as centre `(0,0,0)` and extent `(0,0,0)` — a
+zero-sized box that every pixel is outside of. `outside` is therefore 1 and the
+slot keeps everything, through exactly the same three nodes.
+
+A material graph has no component-wise reduce, so `max(q.x, q.y, q.z)` is three
+ComponentMasks and two Max nodes. That is the honest price of native nodes over
+one line of HLSL.
+
+### Why the max, rather than the full SDF
+
+`max(q.x, q.y, q.z)` is the exact signed distance **inside** the box and the
+distance to the nearest infinite slab outside it. The true metric distance
+needs a second term:
 
 ```hlsl
-q = abs(local) - extents
 d = length(max(q, 0)) + min(max(q.x, q.y, q.z), 0)
 ```
 
-The two terms look bolted together and are not — exactly one is active at a
-time, which is what makes this branch-free:
-
-- **Outside**, at least one component of `q` is positive. `max(q, 0)` zeroes the
-  axes already within the box, leaving the true Euclidean distance to the
-  nearest face, edge or corner — which is what rounds corners correctly instead
-  of reporting distance to an infinite slab. The second term is zero here.
-- **Inside**, every component of `q` is negative, so the first term is zero and
-  the largest (least-negative) component is the distance to the nearest face,
-  correctly signed.
-
-Their sum is the signed distance everywhere. Being a true metric distance in
-world units on *both* sides is what lets one feather width in centimetres behave
-identically on every volume regardless of its scale.
+which is what rounds the corners correctly instead of reporting distance to a
+slab. It matters when the distance is used as a distance — for a rounded cut,
+or a falloff that must look right at a corner. Here it is only thresholded a
+couple of centimetres either side of the surface, where the two agree, so the
+second term would buy a visibly identical result for a `length`, a `max` and a
+`min` in **every clippable material**. The full form is in the `.ush` for when
+capping needs it.
 
 ### Feathering is not cosmetic
 
 The clip test is a step function being point-sampled once per pixel. With a hard
 edge the boundary lands wherever pixel centres happen to fall and *crawls* as
-the box moves. Dividing the signed distance by a few units and saturating turns
-it into a ramp the opacity mask can dither against. It costs one `saturate` on a
-distance already computed.
+the box moves. Dividing by a few units and saturating turns it into a ramp
+instead. It costs one `saturate` on a value already computed.
+
+The divisor is guarded with `max(feather, 0.01)`. The collection defaults to all
+zeros, and there is a window on load between a material compiling and the
+subsystem's first push where the feather really is 0 — unguarded, that is a
+divide by zero whose NaN reaches the opacity mask and blanks the whole building.
 
 ### Combining volumes: intersect the cuts, union the isolations
 
-Two modes compose differently, and getting it wrong produces a confusing tool:
+The two modes compose differently, and collapsing them into one accumulator
+produces a tool that is subtly wrong:
 
 - **Cut Inside** volumes are *subtractive*. Each removes its own contents, so a
-  pixel must survive all of them → **minimum** (soft boolean AND).
+  pixel must survive all of them → **min**. Two boxes each carving a hole carve
+  both holes.
 - **Cut Outside** volumes are *restrictive*. Each keeps only its contents, so a
-  pixel inside **any** of them survives → **maximum** (soft boolean OR).
-  Taking the minimum here would show the empty intersection of two isolated
-  rooms rather than both rooms.
+  pixel inside **any** of them survives → **max**. Taking the min here would
+  show the empty *intersection* of two isolated systems — isolate the pipes and
+  the HVAC and you would see nothing at all.
 
-Intersect the keeps, union the isolates, intersect those two results. Standard
-CSG, and it generalises: a new mode just picks which accumulator it feeds.
+So each volume emits three terms rather than one keep value, and they feed two
+accumulators:
+
+```
+cut_i     = (mode == CutOutside) ? 1 : outside_i
+isolate_i = (mode == CutOutside) ? 1 - outside_i : 0
+flag_i    = (mode == CutOutside) ? 1 : 0
+
+clip = min(min cut_i, lerp(1, max isolate_i, max flag_i))
+```
+
+The flag is not redundant. Without an isolation volume present, `max isolate_i`
+is 0 everywhere, which would erase the building; the flag is what distinguishes
+*"nothing is isolated"* from *"the isolation keeps nothing here"*.
+
+Floor focus and ghosting compose on top:
+
+```
+focus = max(slabKeep, ghostStipple * ghostEnabled)
+final = min(clip, focus)
+```
+
+`max` for the ghost, not multiply: ghosting must **add** survivors back to the
+out-of-focus region, not remove more. And it is deliberately applied only to the
+focus term — a clip box is an explicit "remove this", and having it fade to a
+haze instead of cutting would make the inspection cube useless.
 
 ### Blend Mode must become Masked — and must be set *first*
 
@@ -214,13 +317,17 @@ The difference between them is the bug.
 | | Cost |
 |---|---|
 | CPU, per frame, nothing moving | zero — the push is skipped entirely |
-| CPU, per frame, box moving | 17 vector writes, independent of level size |
-| GPU, per clippable pixel | 4 × (one 3×4 transform + box SDF + saturate) |
+| CPU, per frame, box moving | 27 vector writes, independent of level size |
+| GPU, per clippable pixel | 4 × (subtract, abs, subtract, 2 max, divide, saturate) + slab + dither |
 | Per mesh | **nothing** |
-| Per material | one function call node, added once by script |
+| Per material | ~120 nodes, added once by script |
+
+That node count reads alarming and is not: they collapse to a few dozen ALU
+instructions, there is no texture fetch and no branch anywhere in the group,
+and the node count is an **authoring-time** number, not a runtime one.
 
 `MaxClipVolumes` is 4 and is a **compile-time constant**. A material graph has
-no loops, so volumes are unrolled: every extra slot costs four more collection
+no loops, so volumes are unrolled: every extra slot costs six more collection
 vectors and fixed shader work in *every* clippable material, used or not. Four
 covers an inspection box plus a couple of section cuts. Needing dozens is not a
 bigger number here — it is a structured buffer and a custom vertex factory,
@@ -248,6 +355,41 @@ which is a different and much larger piece of work.
 It works in the editor viewport, not just in PIE — the subsystem ticks in editor
 worlds deliberately, because dragging the box through the building while
 building the level is the primary way this gets used.
+
+### Verifying it, in order
+
+Do these in order. Each one rules out a whole class of cause, and the earlier
+ones are the ones that actually go wrong.
+
+**1. Does the geometry you are looking at use an injected material?**
+This is the single most common reason for "nothing happens", and it is not
+guessable — in our own test level, most of the walls used the template's
+`MI_PrototypeGrid_Gray` rather than the wall material that had been injected.
+Select the mesh, look at its material, and confirm that material (or an
+instance's **parent**) is in the list the injector printed.
+
+**2. `BV.Status`.** It prints, in order: the collection and whether its layout
+validated, the master switch, and then every registered volume with the centre
+and extent it is actually sending. A box in the right place at the wrong size
+and a box at the right size in the wrong place both present as "nothing
+happened"; these numbers separate them.
+
+**3. Drag the box.** Select the Clipping Volume actor in the outliner and move
+it with the gizmo. The cut follows during the drag, not on release — that is
+`PostEditMove` firing with `bFinished == false`. If the numbers in `BV.Status`
+change as you drag but the geometry does not, the problem is in the material,
+not in the C++.
+
+**4. Prove the mask reaches the pixel.** Open one injected material, find the
+final `Min` node feeding Opacity Mask, and temporarily connect a `Constant 0`
+to Opacity Mask instead. Everything using that material should vanish. If it
+does not, the material is not evaluating its opacity mask at all — check the
+blend mode, and see
+[the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
+
+**5. Then the features.** `BV.SelectFloor Floor.02` should leave one storey
+standing; `BV.Ghost 1` should bring the rest back as a stipple; `BV.Reset`
+should restore everything.
 
 ---
 
@@ -299,16 +441,28 @@ behind it was never rendered; those pixels do not exist to blend with. Making
 materials Translucent would work but changes sorting, gives up much of the
 deferred pipeline, and cannot be toggled per frame.
 
-So the ghost alpha is fed through the engine's `DitherTemporalAA`, which turns
-coverage into a jitter-aware stipple that TAA resolves into apparent
-translucency — the same mechanism as UE's own LOD dithering. **It costs
-nothing**, because the injector already had to make every clippable material
-Masked in order to clip correctly in the depth prepass. Ghost mode rides on
-machinery the clip feature was forced to build anyway.
+So the ghost alpha becomes a **screen-space stipple**: keep a pixel when its
+noise value falls under the ghost opacity, so 15% opacity means 15% of pixels
+survive and the wall reads as a haze. **It costs nothing extra**, because the
+injector already had to make every clippable material Masked in order to clip
+correctly in the depth prepass. Ghost mode rides on machinery the clip feature
+was forced to build anyway.
 
-The clip mask and ghost alpha are returned separately (`float2`) rather than
-pre-multiplied, because only the ghost half should be dithered — stippling the
-clip mask would make the cut edge crawl instead of staying crisp.
+The noise is interleaved gradient noise, open-coded in four nodes:
+
+```
+noise = frac(52.9829189 * frac(dot(pixelPosition, float2(0.06711056, 0.00583715))))
+keep  = ceil(saturate(ghostOpacity - noise))
+```
+
+Interleaved gradient noise rather than a texture lookup or a Bayer matrix: no
+sampler, and its high-frequency distribution is what TAA resolves into an even
+tone instead of a crawling pattern. It is driven from **PixelPosition**, not
+ViewportUV — the dither has to be locked to the pixel grid or it swims across
+the surface as the camera moves, which is more distracting than the ghosting.
+
+The stipple is applied only to the focus term, never to the clip mask.
+Stippling the cut would make its edge crawl instead of staying crisp.
 
 ## Console commands
 
@@ -332,8 +486,10 @@ PIE** — no recompile, no Blueprint wiring, no play session needed.
 The three inspection commands exist because **every failure this system can
 have looks identical from the viewport: nothing happens.** A tag typo, geometry
 imported without metadata, an unset parameter collection, and a material
-missing the clip function are four unrelated problems with one symptom.
-`BV.Status` distinguishes them in one line each.
+missing the clip nodes are four unrelated problems with one symptom.
+`BV.Status` distinguishes them in one line each, and now also lists every
+registered volume with the centre and extent it is sending — so a box in the
+wrong place and a box of the wrong size stop looking like the same failure.
 
 `BV.DescribeTag` is the one that answers *"is my room isolation using the
 trigger volume or the walls?"* — both produce a box, and a wrong one just looks
@@ -369,15 +525,30 @@ for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_
 Remember instances inherit from their parent — inject into the **parent
 Material**, not the instance.
 
-**4. Plugin `.ush` edits require an editor restart.** `recompileshaders
-changed` does **not** pick up an include pulled in through a material Custom
-node. If you have edited the shader and nothing changed, you are still running
-the old code — restart before drawing any conclusion.
+**4. Did you change the collection layout?** `MaxClipVolumes`,
+`ClipParameterPrefix`, or any parameter name. Three things must agree, and
+nothing checks two of them for you:
+
+```python
+import setup_building_visualization as bv
+bv.create_assets()                       # rebuild the MPC
+bv.inject_into_path("/Game/Building")    # rebuild every graph that reads it
+```
+
+`BV.Status` reports a mismatched layout as invalid on the C++ side, but a
+material still carrying the *old* parameter names compiles perfectly and reads
+zeros. Re-inject after any layout change.
 
 **5. If an edit is accepted but has no effect,** test a second edit through the
 same path that you *know* should be visible (base colour is ideal). If that one
 shows and yours does not, the problem is a material property, not your graph.
 See [the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
+
+**6. Nothing is disabled above you.** Master switch (`BV.Clip 1`), the volume's
+own `Clip Mode` (Disabled is a valid state and looks exactly like broken), and
+`BV.Status`'s per-volume list, which prints the centre and extent each volume is
+actually sending. A box in the right place with the wrong extent, and a box with
+the right extent in the wrong place, both present as "nothing happened".
 
 ### The editor hangs on startup after a script deleted an asset
 
@@ -415,6 +586,8 @@ hangs.
 - [x] Semantic selection via actor tags (`Floor.08`, `System.Pipe`, …)
 - [x] Ghost mode via dithered opacity
 - [x] Combined floor isolation + clipping + ghosting
+- [x] Native-node injection — no material function, no Custom node
+- [ ] Rotated clip volumes (matrix already published; graph reads centre/extent)
 - [ ] Capped cross-sections (solid cut faces)
 
 ## Licence
