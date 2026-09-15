@@ -171,9 +171,13 @@ def _custom_node_code():
     version-controlled, diffable and editable without touching any asset. A
     long HLSL blob living inside a .uasset is effectively unreviewable.
 
-    Parameters.SvPosition.xy is the pixel coordinate for the ghost stipple,
-    read from the Custom node's implicit Parameters struct rather than wired in
-    as a ScreenPosition input - one less connection to build.
+    ScreenUV for the ghost stipple arrives as an explicit INPUT, wired from a
+    ScreenPosition node. It is emphatically NOT read from the Custom node's
+    implicit Parameters struct: Parameters.SvPosition exists only in the
+    pixel-shader parameter struct, and a material is translated for several
+    stages including the vertex shader, so touching it implicitly makes the
+    node valid in some permutations and not others. A ScreenPosition node is
+    translated correctly for whichever stage is being generated.
     """
     args = []
     for i in range(MAX_CLIP_VOLUMES):
@@ -182,7 +186,7 @@ def _custom_node_code():
             "Row2_{}".format(i), "Params_{}".format(i),
         ])
     return ("return BuildingClip_Evaluate(WorldPos, {}, Globals, FocusSlab, Ghost, "
-            "Parameters.SvPosition.xy);".format(", ".join(args)))
+            "ScreenUV);".format(", ".join(args)))
 
 
 def _remove_existing_clip_nodes(material):
@@ -248,6 +252,27 @@ def inject_into_material(material, collection):
     if material is None:
         return False
 
+    # Read the pre-existing opacity mask BEFORE touching anything.
+    #
+    # Order matters and the failure is severe. Reading it after creating our
+    # own nodes can return one of them - in particular the multiply we are
+    # about to build - and wiring that into its own input creates a cycle in
+    # the graph. A cyclic material does not error: the translator follows it
+    # forever, so the editor hangs while LOADING any level that uses the
+    # material, before the map load is even logged. Diagnosed by diffing a
+    # working boot log against a wedged one and seeing that "MAP LOAD" never
+    # appeared.
+    #
+    # Anything tagged as ours is treated as absent, because on a re-run it is
+    # about to be deleted a few lines below.
+    existing_mask = _mel.get_material_property_input_node(
+        material, unreal.MaterialProperty.MP_OPACITY_MASK)
+    try:
+        if existing_mask is not None and existing_mask.get_editor_property("desc") == CLIP_NODE_TAG:
+            existing_mask = None
+    except Exception:
+        pass
+
     removed = _remove_existing_clip_nodes(material)
 
     # The Custom node. Its description becomes the generated HLSL function
@@ -260,8 +285,12 @@ def inject_into_material(material, collection):
     custom.set_editor_property("include_file_paths", [INCLUDE_PATH])
 
     # Inputs, in the order the generated HLSL expects.
-    inputs = [("WorldPos", _tag(_mel.create_material_expression(
-        material, unreal.MaterialExpressionWorldPosition, -1400, 300)))]
+    inputs = [
+        ("WorldPos", _tag(_mel.create_material_expression(
+            material, unreal.MaterialExpressionWorldPosition, -1400, 240))),
+        ("ScreenUV", _tag(_mel.create_material_expression(
+            material, unreal.MaterialExpressionScreenPosition, -1400, 300))),
+    ]
 
     y = 380
     for name in _param_names():
@@ -301,10 +330,7 @@ def inject_into_material(material, collection):
     # inert: that is what pointed at the property rather than at the graph.
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
 
-    existing_mask = _mel.get_material_property_input_node(
-        material, unreal.MaterialProperty.MP_OPACITY_MASK)
-
-    if existing_mask is not None and existing_mask not in [n for _i, n in inputs]:
+    if existing_mask is not None:
         mult = _tag(_mel.create_material_expression(
             material, unreal.MaterialExpressionMultiply, -600, 400))
         _connect(custom, "", mult, "B", "clip mask -> multiply B")
@@ -318,6 +344,48 @@ def inject_into_material(material, collection):
     if removed:
         _log("Replaced {} previously generated node(s) in {}.".format(removed, material.get_name()))
     return True
+
+
+def remove_from_material(material):
+    """
+    Strips everything this script added and puts the material back to Opaque.
+
+    A bulk injector needs a bulk uninstall. Without one the only way back is
+    source control, and "revert thirty assets" is a much worse answer than
+    "run the inverse function" - especially while the system is still being
+    developed and injection is being re-run often.
+
+    It is also the first thing to reach for when the editor starts behaving
+    badly after an injection: strip everything, confirm the project is healthy
+    again, and you have bisected the problem to this plugin in one step.
+    """
+    if material is None:
+        return False
+
+    removed = _remove_existing_clip_nodes(material)
+    if removed == 0:
+        return False
+
+    # Opacity mask now points at a deleted node. Put the material back to
+    # Opaque so nothing is left reading a dangling input.
+    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    _mel.recompile_material(material)
+    _log("Removed {} node(s) from {} and restored Opaque.".format(removed, material.get_name()))
+    return True
+
+
+def remove_from_path(content_path):
+    """Strips the clip nodes from every material under a content path."""
+    changed = 0
+    for asset_path in unreal.EditorAssetLibrary.list_assets(content_path, recursive=True):
+        data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
+        if data.asset_class_path.asset_name != "Material":
+            continue
+        if remove_from_material(data.get_asset()):
+            unreal.EditorAssetLibrary.save_asset(asset_path)
+            changed += 1
+    _log("Stripped {} material(s) under {}.".format(changed, content_path))
+    return changed
 
 
 def inject_into_path(content_path, dry_run=False):

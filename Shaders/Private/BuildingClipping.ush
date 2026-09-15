@@ -179,8 +179,11 @@ float BuildingClip_FocusSlab(float3 WorldPosition, float4 FocusSlab)
  * single Custom node wired straight to its output: one connection, which is
  * exactly the topology already proven to work by the clipping path.
  */
-float BuildingClip_DitherNoise(float2 PixelPos)
+float BuildingClip_DitherNoise(float2 ScreenUV)
 {
+	// Scaled to pixels first: the hash needs values that vary per pixel, and a
+	// 0..1 UV would land almost every pixel of a wall in the same bucket.
+	const float2 PixelPos = ScreenUV * 2048.0f;
 	return frac(52.9829189f * frac(dot(PixelPos, float2(0.06711056f, 0.00583715f))));
 }
 
@@ -203,7 +206,15 @@ float BuildingClip_DitherNoise(float2 PixelPos)
  * feature was forced to build anyway.
  *
  * GhostParams: .x = ghost opacity 0..1, .y = enabled, .z/.w reserved.
- * PixelPos: SV_Position.xy, supplied by the Custom node as Parameters.SvPosition.xy.
+ * ScreenUV: 0..1 viewport coordinates, wired in from a ScreenPosition node.
+ *
+ * Deliberately an explicit INPUT rather than reading Parameters.SvPosition
+ * inside the Custom node. SvPosition only exists in the pixel-shader parameter
+ * struct, and a material is translated for several stages - the vertex shader
+ * among them - so touching it implicitly makes the node valid in some
+ * permutations and not others. A ScreenPosition node is translated correctly
+ * for whichever stage is being generated, and it is the engine's job to know
+ * which that is, not this file's.
  */
 float BuildingClip_Evaluate(
 	float3 WorldPosition,
@@ -211,7 +222,7 @@ float BuildingClip_Evaluate(
 	float4 Row0_1, float4 Row1_1, float4 Row2_1, float4 Params_1,
 	float4 Row0_2, float4 Row1_2, float4 Row2_2, float4 Params_2,
 	float4 Row0_3, float4 Row1_3, float4 Row2_3, float4 Params_3,
-	float4 Globals, float4 FocusSlab, float4 GhostParams, float2 PixelPos)
+	float4 Globals, float4 FocusSlab, float4 GhostParams, float2 ScreenUV)
 {
 	const float FeatherWidth = Globals.y;
 
@@ -265,7 +276,7 @@ float BuildingClip_Evaluate(
 	// exactly 1.0 losing to a noise value of exactly 1.0.
 	const float GhostMask = (GhostAlpha >= 1.0f)
 		? 1.0f
-		: step(BuildingClip_DitherNoise(PixelPos), GhostAlpha);
+		: step(BuildingClip_DitherNoise(ScreenUV), GhostAlpha);
 
 	return ClipMask * GhostMask;
 }
