@@ -9,20 +9,24 @@ swapped, duplicated, or iterated over — the GPU does the spatial test per pixe
 and the CPU cost is proportional to the number of clip volumes, not the number
 of objects in the building.
 
-| `BV.Clip 1` | `BV.Clip 0` |
-|---|---|
-| ![clipping on](Docs/clipping-on.png) | ![clipping off](Docs/clipping-off.png) |
-
-The blue wireframe is the Clipping Volume actor. Nothing about the wall, the
-cylinder or the floor was touched — they share the building's materials, and
-the cut is decided per pixel from one global parameter buffer.
-
-> **Status: working.** Clip volumes, floor selection, room/system isolation and
-> dithered ghosting are implemented and verified cutting geometry in the editor
-> viewport. Clip volumes are **axis-aligned** — rotation is published by the C++
-> but not yet consumed by the graph, see
-> [Axis-aligned, for now](#axis-aligned-for-now). Capped cross-sections are next
-> — see [Roadmap](#roadmap).
+> **Status: not yet cutting.** The CPU half is verified end to end — the
+> collection reads back exactly the volume's world centre, half-extent and mode
+> (`ClipCenter_0 = (1205, 1260, 288, 1.0)`, `ClipExtent_0 = (200, 200, 200, 0)`)
+> — and every clippable material is Masked with the generated node group on its
+> Opacity Mask pin. Geometry inside the volume is nonetheless still drawn.
+> A `BV.Clip 1` / `BV.Clip 0` screenshot pair differs by 0.15% of pixels, which
+> is noise.
+>
+> **Do not trust a screenshot pair by eye.** The pair above this line used to be
+> presented as a working before/after; diffing it programmatically showed the
+> two images were the same, and the console command that was supposed to toggle
+> the feature had failed silently with "No world available". Both of those are
+> fixed; the remaining defect is real and is in the material graph or in how it
+> reaches the pixel.
+>
+> Clip volumes are also **axis-aligned** — rotation is published by the C++ but
+> not consumed by the graph, see [Axis-aligned, for now](#axis-aligned-for-now).
+> Capped cross-sections come after this works — see [Roadmap](#roadmap).
 
 ---
 
@@ -57,7 +61,7 @@ AClippingVolumeActor ──┘         │
                                  │
                                  │  read by
                                  ▼
-              ~100 native material nodes, built by the injector
+              ~120 native material nodes, built by the injector
                                  │
                                  ▼
                   every clippable material → Opacity Mask
@@ -544,7 +548,17 @@ same path that you *know* should be visible (base colour is ideal). If that one
 shows and yours does not, the problem is a material property, not your graph.
 See [the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
 
-**6. Nothing is disabled above you.** Master switch (`BV.Clip 1`), the volume's
+**6. Driving these from a script?** The commands take their world from the
+console context, and a dispatch with no context object — Python's
+`execute_console_command(None, ...)`, an `-ExecCmds` entry at startup — supplies
+none. They now fall back to the PIE world, then the editor world, so automation
+works; but **read the state back rather than trusting the command**
+(`IsClippingEnabled()`), because a command that silently did nothing and a
+feature that silently did nothing look the same in a screenshot. That mistake
+produced a convincing-looking before/after pair here that turned out to be two
+copies of the same image.
+
+**7. Nothing is disabled above you.** Master switch (`BV.Clip 1`), the volume's
 own `Clip Mode` (Disabled is a valid state and looks exactly like broken), and
 `BV.Status`'s per-volume list, which prints the centre and extent each volume is
 actually sending. A box in the right place with the wrong extent, and a box with
@@ -587,6 +601,8 @@ hangs.
 - [x] Ghost mode via dithered opacity
 - [x] Combined floor isolation + clipping + ghosting
 - [x] Native-node injection — no material function, no Custom node
+- [ ] **Make the injected mask actually reach the pixel** — parameters and graph
+      verified, geometry still drawn
 - [ ] Rotated clip volumes (matrix already published; graph reads centre/extent)
 - [ ] Capped cross-sections (solid cut faces)
 

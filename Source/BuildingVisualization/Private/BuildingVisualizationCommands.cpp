@@ -17,6 +17,7 @@
 
 #include "BuildingVisualization.h"
 #include "BuildingVisualizationSubsystem.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
@@ -36,9 +37,47 @@ namespace BuildingVisualizationCommands
 	{
 		if (!World)
 		{
-			UE_LOG(LogBuildingVisualization, Error,
-				TEXT("No world available for this command."));
-			return nullptr;
+			// The console hands a world to commands typed into a viewport, but
+			// not to ones dispatched with no context object - which is exactly
+			// how automation calls them (Python's execute_console_command with
+			// a null world, an -ExecCmds entry at startup). Refusing there made
+			// every one of these commands untestable without a human at the
+			// keyboard, which is the wrong way round for a tool whose entire
+			// purpose is diagnosing a silent failure.
+			//
+			// Prefer a play world if one exists, on the grounds that if someone
+			// is in PIE that is what they are looking at.
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() && (Context.WorldType == EWorldType::PIE || Context.WorldType == EWorldType::Game))
+				{
+					World = Context.World();
+					break;
+				}
+			}
+
+			if (!World)
+			{
+				for (const FWorldContext& Context : GEngine->GetWorldContexts())
+				{
+					if (Context.World() && Context.WorldType == EWorldType::Editor)
+					{
+						World = Context.World();
+						break;
+					}
+				}
+			}
+
+			if (!World)
+			{
+				UE_LOG(LogBuildingVisualization, Error,
+					TEXT("No world available for this command, and no Game, PIE or Editor world to fall ")
+					TEXT("back to. Is a level loaded?"));
+				return nullptr;
+			}
+
+			UE_LOG(LogBuildingVisualization, Verbose,
+				TEXT("No world context supplied; using '%s'."), *World->GetName());
 		}
 
 		UBuildingVisualizationSubsystem* Subsystem = World->GetSubsystem<UBuildingVisualizationSubsystem>();
