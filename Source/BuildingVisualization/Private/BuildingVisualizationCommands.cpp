@@ -22,6 +22,8 @@
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInterface.h"
 
 namespace BuildingVisualizationCommands
 {
@@ -327,6 +329,66 @@ namespace BuildingVisualizationCommands
 			*Tag.ToString(), Count, Union.Min.Z, Union.Max.Z,
 			Union.GetExtent().X, Union.GetExtent().Y, Union.GetExtent().Z);
 	}
+
+	/**
+	 * Prints what the RENDERER thinks a material is, not what the asset says.
+	 *
+	 * These can disagree, and when they do nothing else in this plugin's
+	 * diagnostics will tell you. UMaterial::GetBlendMode() returns Opaque for a
+	 * Masked material whenever bCanMaskedBeAssumedOpaque is set - a serialized
+	 * flag, invisible in the material editor, not exposed to Python, and only
+	 * recomputed by an editor-side change of the material. A material can
+	 * therefore report Masked to every check you can make from script, carry a
+	 * correct Opacity Mask expression, and still be drawn as fully opaque.
+	 *
+	 * Usage: BV.DumpMaterial /Game/Path/M_Thing
+	 */
+	static void DumpMaterial(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!Args.IsValidIndex(0))
+		{
+			UE_LOG(LogBuildingVisualization, Warning,
+				TEXT("Usage: BV.DumpMaterial /Game/Path/M_Thing"));
+			return;
+		}
+
+		UMaterialInterface* Interface = LoadObject<UMaterialInterface>(nullptr, *Args[0]);
+		if (!Interface)
+		{
+			UE_LOG(LogBuildingVisualization, Error, TEXT("No material at '%s'."), *Args[0]);
+			return;
+		}
+
+		UMaterial* Material = Interface->GetMaterial();
+
+		UE_LOG(LogBuildingVisualization, Display, TEXT("--- %s ---"), *Args[0]);
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  base material      : %s"),
+			Material ? *Material->GetPathName() : TEXT("<none>"));
+
+		// The whole point of this command: the stored value versus the value
+		// the renderer actually uses.
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  BlendMode (stored) : %d"),
+			Material ? static_cast<int32>(Material->BlendMode) : -1);
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  GetBlendMode()     : %d %s"),
+			static_cast<int32>(Interface->GetBlendMode()),
+			Interface->GetBlendMode() == BLEND_Masked ? TEXT("(Masked)")
+				: Interface->GetBlendMode() == BLEND_Opaque ? TEXT("(Opaque) <-- mask will NOT be evaluated")
+				: TEXT(""));
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  IsMasked()         : %s"),
+			Interface->IsMasked() ? TEXT("true") : TEXT("false"));
+		UE_LOG(LogBuildingVisualization, Display, TEXT("  OpacityMaskClipVal : %.4f"),
+			Interface->GetOpacityMaskClipValue());
+
+#if WITH_EDITOR
+		if (Material)
+		{
+			UE_LOG(LogBuildingVisualization, Display, TEXT("  OpacityMask pin    : %s"),
+				Material->GetEditorOnlyData()->OpacityMask.IsConnected() ? TEXT("connected") : TEXT("NOT connected"));
+			UE_LOG(LogBuildingVisualization, Display, TEXT("  IsPropertyConnected: %s"),
+				Material->IsPropertyConnected(MP_OpacityMask) ? TEXT("true") : TEXT("false <-- cached data is stale"));
+		}
+#endif
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -350,5 +412,6 @@ BV_CONSOLE_COMMAND("BV.Reset",         "Reset all visualization state.",        
 BV_CONSOLE_COMMAND("BV.Status",        "Print current clipping/selection/ghost state.",                  Status);
 BV_CONSOLE_COMMAND("BV.ListTags",      "List actor tags in the world. Usage: BV.ListTags Room.",         ListTags);
 BV_CONSOLE_COMMAND("BV.DescribeTag",   "List actors with a tag, their class and bounds.",                DescribeTag);
+BV_CONSOLE_COMMAND("BV.DumpMaterial",  "What the renderer thinks a material is. Usage: BV.DumpMaterial /Game/X/M_Y", DumpMaterial);
 
 #undef BV_CONSOLE_COMMAND

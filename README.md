@@ -9,24 +9,31 @@ swapped, duplicated, or iterated over — the GPU does the spatial test per pixe
 and the CPU cost is proportional to the number of clip volumes, not the number
 of objects in the building.
 
-> **Status: not yet cutting.** The CPU half is verified end to end — the
-> collection reads back exactly the volume's world centre, half-extent and mode
-> (`ClipCenter_0 = (1205, 1260, 288, 1.0)`, `ClipExtent_0 = (200, 200, 200, 0)`)
-> — and every clippable material is Masked with the generated node group on its
-> Opacity Mask pin. Geometry inside the volume is nonetheless still drawn.
-> A `BV.Clip 1` / `BV.Clip 0` screenshot pair differs by 0.15% of pixels, which
-> is noise.
+> **Status: not cutting yet; one real cause found and fixed, one still open.**
 >
-> **Do not trust a screenshot pair by eye.** The pair above this line used to be
-> presented as a working before/after; diffing it programmatically showed the
-> two images were the same, and the console command that was supposed to toggle
-> the feature had failed silently with "No world available". Both of those are
-> fixed; the remaining defect is real and is in the material graph or in how it
-> reaches the pixel.
+> Verified working: the collection reads back the volume's exact world centre,
+> half-extent and mode; the generated node group produces a **correct** mask
+> (routing the node that feeds Opacity Mask to Base Colour instead renders a
+> crisp black box exactly inside the volume, across wall, floor and cylinder);
+> and every clippable material now reports masked to the *renderer*, not just
+> in its asset settings.
 >
-> Clip volumes are also **axis-aligned** — rotation is published by the C++ but
-> not consumed by the graph, see [Axis-aligned, for now](#axis-aligned-for-now).
-> Capped cross-sections come after this works — see [Roadmap](#roadmap).
+> **Cause found and fixed:** `UMaterial::GetBlendMode()` returns **Opaque** for
+> a Masked material whenever `bCanMaskedBeAssumedOpaque` is set. See
+> [the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
+>
+> **Still open:** with all of the above true, geometry inside the volume is
+> still drawn. A literal `Constant 0` wired to Opacity Mask on an affected
+> material does not remove it either, while the same literal zero on a
+> *freshly created* material removes the same mesh completely. So the remaining
+> fault is not in this plugin's maths, its parameters, or its blend mode
+> handling - something about the pre-existing materials still prevents the mask
+> being applied. Next step is a single controlled comparison of those two
+> materials' compiled shaders.
+>
+> Clip volumes are also **axis-aligned** - rotation is published by the C++ but
+> not consumed by the graph, see
+> [Axis-aligned, for now](#axis-aligned-for-now).
 
 ---
 
@@ -88,10 +95,16 @@ bv.inject_into_path("/Game/Building", dry_run=True)   # check the list
 bv.inject_into_path("/Game/Building")
 ```
 
-Only **Material** assets are touched, never Material Instances — an instance
-inherits its parent's graph, so injecting into the parent covers every instance
-for free. That is why a building sharing one master material across thousands
-of meshes costs exactly one injection.
+Only **Material** assets have nodes added, never Material Instances — an
+instance inherits its parent's graph, so injecting into the parent covers every
+instance for free. That is why a building sharing one master material across
+thousands of meshes costs exactly one injection. Instances are still *refreshed*
+afterwards, which is not the same thing and matters — see
+[troubleshooting](#troubleshooting).
+
+Engine content (`/Engine/...`) is skipped outright. It lives in the engine
+install rather than the project, so editing it damages every project on the
+machine and is undone only by verifying the install.
 
 A per-pixel cut has to execute in the material shader — `clip()` runs nowhere
 else, and no engine switch injects it globally. Given that constraint, the goal
@@ -558,7 +571,41 @@ feature that silently did nothing look the same in a screenshot. That mistake
 produced a convincing-looking before/after pair here that turned out to be two
 copies of the same image.
 
-**7. Nothing is disabled above you.** Master switch (`BV.Clip 1`), the volume's
+**7. `BV.DumpMaterial /Game/Path/M_Thing`.** Prints what the **renderer**
+thinks the material is, which is not always what the asset says:
+
+```
+BlendMode (stored) : 1
+GetBlendMode()     : 0 (Opaque) <-- mask will NOT be evaluated
+IsMasked()         : false
+```
+
+`UMaterial::GetBlendMode()` returns Opaque for a Masked material whenever
+`bCanMaskedBeAssumedOpaque` is set - an optimisation flag for materials whose
+opacity mask is trivially 1. It is serialized into the asset, invisible in the
+material editor, absent from the Python API, and recomputed by nothing the
+scripting API can reach. A material authored Opaque and later made Masked *by
+script* keeps the stale flag and is drawn fully opaque, while every check you
+can make from script insists it is correct.
+
+The injector now calls `RepairMaskedBlendMode` (C++) to recompute it. If you
+build graphs by script yourself, call it too - or dump the material and look.
+
+**8. Material Instances need refreshing after their parent is injected.**
+Injection changes the parent's blend mode to Masked and adds nodes, and an
+instance that sets any **static** parameter owns a *separate shader map*,
+compiled from the parent as it was at the time. Leave it alone and it keeps
+drawing with the old permutation — one that contains no opacity mask at all.
+
+The symptom is the worst one this system produces, because every check passes:
+the parent is Masked, its Opacity Mask pin is connected, the mask value is
+provably correct when you route it to Base Colour — and the geometry is still
+solid, because the mesh in the viewport is drawn with the *instance's* stale
+shader, not the parent's. `inject_into_path` now calls `update_instances_of`
+over `/Game` for every material it touched. If you inject a material by hand,
+call it yourself.
+
+**9. Nothing is disabled above you.** Master switch (`BV.Clip 1`), the volume's
 own `Clip Mode` (Disabled is a valid state and looks exactly like broken), and
 `BV.Status`'s per-volume list, which prints the centre and extent each volume is
 actually sending. A box in the right place with the wrong extent, and a box with

@@ -115,6 +115,45 @@ def _connect(src, src_out, dst, dst_in, what):
             "Failed to connect {}: output '{}' -> input '{}'.".format(what, src_out, dst_in))
 
 
+def _notify_changed(material):
+    """
+    Makes the material re-derive the state it caches from its own graph.
+
+    Two separate things are needed, and neither is optional.
+
+    1. A change notification. UObject::PostEditChange is not exposed to Python,
+       but set_editor_property takes a notify mode, and ALWAYS fires the
+       notification even when the value written equals the value already there.
+       Writing the blend mode back over itself is a no-op that produces exactly
+       that notification.
+
+    2. RepairMaskedBlendMode, in C++. `UMaterial::GetBlendMode()` returns
+       **Opaque** for a Masked material whenever `bCanMaskedBeAssumedOpaque` is
+       set - an optimisation flag for materials whose mask is trivially 1. It is
+       serialized into the asset, invisible in the material editor, absent from
+       the Python API, and recomputed by nothing the scripting API can reach.
+
+       A material authored Opaque and later made Masked by script therefore
+       keeps the stale flag and is drawn fully opaque, while every check
+       available from script insists it is correct: blend mode reads Masked, the
+       Opacity Mask pin reads connected, the cached connected-property data
+       reads true, and routing the mask to Base Colour shows the right value.
+       Only GetBlendMode() disagrees, and only from C++.
+    """
+    try:
+        material.set_editor_property(
+            "blend_mode", material.get_editor_property("blend_mode"),
+            unreal.PropertyAccessChangeNotifyMode.ALWAYS)
+    except Exception as e:
+        _log("WARNING: could not notify {} of its change: {}".format(material.get_name(), e))
+
+    try:
+        unreal.BuildingVisualizationLibrary.repair_masked_blend_mode(material)
+    except Exception as e:
+        _log("WARNING: could not repair the blend mode of {}: {}. Is the plugin's "
+             "C++ module built?".format(material.get_name(), e))
+
+
 def _param_names():
     """The full ordered list of vector parameters, matching the C++ naming."""
     names = []
@@ -501,6 +540,23 @@ def _build_ghost(b, x, y):
                     x + 1220, y + 120, "ghost gate")
 
 
+def is_protected(material):
+    """
+    True for assets this script must never modify.
+
+    Engine content lives inside the engine INSTALL, not the project, so editing
+    it damages every project on the machine and cannot be undone with source
+    control - only by verifying the install in the Epic launcher. It is also
+    easy to hit by accident: a sky dome, a default material or an engine
+    primitive sitting in a test level is picked up by any "inject into every
+    material used here" sweep.
+    """
+    if material is None:
+        return True
+    path = material.get_path_name()
+    return path.startswith("/Engine/") or path.startswith("/Script/")
+
+
 def inject_into_material(material, collection):
     """
     Builds the clip node group inside one material and routes it to Opacity Mask.
@@ -520,7 +576,9 @@ def inject_into_material(material, collection):
 
     Returns True if the material was modified.
     """
-    if material is None:
+    if is_protected(material):
+        if material is not None:
+            _log("SKIPPED {} - engine content is never modified.".format(material.get_path_name()))
         return False
 
     # Read the pre-existing opacity mask BEFORE touching anything.
@@ -624,6 +682,22 @@ def inject_into_material(material, collection):
     else:
         _mel.connect_material_property(final, "", unreal.MaterialProperty.MP_OPACITY_MASK)
 
+    # PostEditChange, not just recompile.
+    #
+    # A UMaterial derives cached state from its graph when the editor tells it
+    # the asset changed - among it the flags that decide whether the renderer
+    # may treat a Masked material as opaque. Nothing in the Python material API
+    # fires that: set_editor_property, connect_material_property and
+    # recompile_material all leave the derived state exactly as it was when the
+    # asset was last edited by hand.
+    #
+    # On a material that was authored Opaque with no Opacity Mask, that stale
+    # state says "this may be drawn as opaque", and it survives being set to
+    # Masked, having an expression wired to Opacity Mask, being recompiled,
+    # saved, reloaded in a new editor, and even being duplicated. The result is
+    # a material that reports Masked, shows a correct mask value when that same
+    # node is routed to Base Colour, and never clips a pixel.
+    _notify_changed(material)
     _mel.recompile_material(material)
 
     _log("Injected {} node(s) into {}{}.".format(
@@ -645,7 +719,7 @@ def remove_from_material(material):
     badly after an injection: strip everything, confirm the project is healthy
     again, and you have bisected the problem to this plugin in one step.
     """
-    if material is None:
+    if is_protected(material):
         return False
 
     removed = _remove_existing_clip_nodes(material)
@@ -655,6 +729,7 @@ def remove_from_material(material):
     # Opacity mask now points at a deleted node. Put the material back to
     # Opaque so nothing is left reading a dangling input.
     material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    _notify_changed(material)
     _mel.recompile_material(material)
     _log("Removed {} node(s) from {} and restored Opaque.".format(removed, material.get_name()))
     return True
@@ -672,6 +747,57 @@ def remove_from_path(content_path):
             changed += 1
     _log("Stripped {} material(s) under {}.".format(changed, content_path))
     return changed
+
+
+def update_instances_of(material_paths, search_root="/Game"):
+    """
+    Recompiles every Material Instance descended from a material we injected into.
+
+    Injection changes the parent's blend mode to Masked and adds nodes, and an
+    instance does NOT necessarily pick that up on its own: an instance that sets
+    any static parameter owns a separate shader map, compiled from the parent as
+    it was at the time. Leave it alone and it keeps rendering with the old
+    permutation - one that has no opacity mask in it at all.
+
+    The symptom is the single most confusing one this system produces: the
+    parent material is Masked, its Opacity Mask pin is connected, the mask value
+    is provably correct when routed to Base Colour, and the geometry is still
+    solid - because the mesh in the viewport is drawn with the instance's stale
+    shader, not the parent's.
+
+    Instances are searched for from `search_root` rather than from the injected
+    material's own folder, because an instance is very often authored somewhere
+    else entirely (a level's own folder, a variant folder).
+    """
+    targets = set(material_paths)
+    updated = 0
+
+    for asset_path in unreal.EditorAssetLibrary.list_assets(search_root, recursive=True):
+        data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
+        if str(data.asset_class_path.asset_name) != "MaterialInstanceConstant":
+            continue
+
+        instance = data.get_asset()
+
+        # Walk the whole chain: instances of instances are common, and only the
+        # root is ever injected into.
+        node = instance
+        hit = False
+        while isinstance(node, unreal.MaterialInstance):
+            node = node.get_editor_property("parent")
+            if node is not None and node.get_path_name() in targets:
+                hit = True
+                break
+        if not hit:
+            continue
+
+        _mel.update_material_instance(instance)
+        unreal.EditorAssetLibrary.save_asset(asset_path)
+        updated += 1
+        _log("Updated instance {}".format(asset_path))
+
+    _log("Refreshed {} material instance(s).".format(updated))
+    return updated
 
 
 def inject_into_path(content_path, dry_run=False):
@@ -693,6 +819,7 @@ def inject_into_path(content_path, dry_run=False):
 
     assets = unreal.EditorAssetLibrary.list_assets(content_path, recursive=True)
     changed = 0
+    injected = []
 
     for asset_path in assets:
         data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
@@ -706,7 +833,11 @@ def inject_into_path(content_path, dry_run=False):
 
         if inject_into_material(data.get_asset(), collection):
             unreal.EditorAssetLibrary.save_asset(asset_path)
+            injected.append(data.get_asset().get_path_name())
             changed += 1
+
+    if not dry_run and injected:
+        update_instances_of(injected)
 
     _log("{} {} material(s) under {}."
          .format("would modify" if dry_run else "modified", changed, content_path))
