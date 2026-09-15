@@ -161,32 +161,57 @@ float BuildingClip_FocusSlab(float3 WorldPosition, float4 FocusSlab)
 }
 
 /**
- * Returns .x = clip mask, .y = ghost alpha.
+ * Interleaved gradient noise - Jorge Jimenez's hash, one frac and one dot.
  *
- * Two outputs rather than one because they are consumed differently and must
- * not be pre-multiplied here. The clip mask is a hard geometric decision. The
- * ghost alpha is a *coverage* that the material graph feeds through
- * DitherTemporalAA, which converts it into a stipple pattern that TAA then
- * resolves into apparent translucency.
+ * Returns a well-distributed 0..1 value per pixel, used as the threshold a
+ * ghost coverage is compared against. Compared to an ordered Bayer matrix it
+ * has no visible tiling structure, which matters because a 4x4 Bayer pattern
+ * on a large flat wall reads as a grid rather than as transparency.
  *
- * That distinction is what makes ghosting free. A post-process tint cannot
- * make an opaque wall see-through, because whatever is behind it was never
- * rendered - the pixels do not exist to blend with. Making the material
- * Translucent would work but changes sorting, disables a lot of the deferred
- * pipeline, and cannot be toggled per frame. Dithering a Masked material costs
- * nothing extra, because the injector has already made every clippable
- * material Masked in order to clip correctly in the depth prepass. The ghost
- * mode rides on machinery the clip feature had to build anyway.
+ * This replaces the engine's DitherTemporalAA function. That version is
+ * jitter-aware and resolves more cleanly under TAA, but reaching it meant
+ * building a multi-node graph from Python - a ComponentMask, the function
+ * call, and a Multiply - and connections made inside a material function do
+ * not reliably persist through the scripting API. The nodes appear, the wires
+ * do not, and the result compiles perfectly while doing nothing.
+ *
+ * Doing it here costs a few instructions and makes the material function a
+ * single Custom node wired straight to its output: one connection, which is
+ * exactly the topology already proven to work by the clipping path.
+ */
+float BuildingClip_DitherNoise(float2 PixelPos)
+{
+	return frac(52.9829189f * frac(dot(PixelPos, float2(0.06711056f, 0.00583715f))));
+}
+
+/**
+ * The whole evaluation, returning one opacity mask value.
+ *
+ * Clip and ghost are combined here rather than being returned separately for
+ * the material graph to combine, because the graph is the fragile part. The
+ * two are still conceptually distinct and only the ghost half is dithered -
+ * stippling the clip mask would make the cut edge crawl instead of staying
+ * crisp - but that distinction is now enforced in code rather than in wires.
+ *
+ * Why dither at all: a post-process tint cannot make an opaque wall
+ * see-through, because whatever is behind it was never rendered, so there are
+ * no pixels to blend with. Marking the material Translucent would work but
+ * changes sorting, gives up much of the deferred pipeline, and cannot be
+ * toggled per frame. Stipple-discarding a Masked material costs nothing extra,
+ * because the injector already had to make every clippable material Masked for
+ * the depth prepass to clip correctly. Ghost mode rides on machinery the clip
+ * feature was forced to build anyway.
  *
  * GhostParams: .x = ghost opacity 0..1, .y = enabled, .z/.w reserved.
+ * PixelPos: SV_Position.xy, supplied by the Custom node as Parameters.SvPosition.xy.
  */
-float2 BuildingClip_Evaluate(
+float BuildingClip_Evaluate(
 	float3 WorldPosition,
 	float4 Row0_0, float4 Row1_0, float4 Row2_0, float4 Params_0,
 	float4 Row0_1, float4 Row1_1, float4 Row2_1, float4 Params_1,
 	float4 Row0_2, float4 Row1_2, float4 Row2_2, float4 Params_2,
 	float4 Row0_3, float4 Row1_3, float4 Row2_3, float4 Params_3,
-	float4 Globals, float4 FocusSlab, float4 GhostParams)
+	float4 Globals, float4 FocusSlab, float4 GhostParams, float2 PixelPos)
 {
 	const float FeatherWidth = Globals.y;
 
@@ -234,5 +259,13 @@ float2 BuildingClip_Evaluate(
 		GhostAlpha = lerp(GhostParams.x, 1.0f, InFocus);
 	}
 
-	return float2(ClipMask, GhostAlpha);
+	// Coverage becomes a stipple. Fully in-focus geometry short-circuits to 1
+	// so the common case never pays for the noise, and - more importantly - so
+	// a focused surface is never accidentally dithered by a threshold of
+	// exactly 1.0 losing to a noise value of exactly 1.0.
+	const float GhostMask = (GhostAlpha >= 1.0f)
+		? 1.0f
+		: step(BuildingClip_DitherNoise(PixelPos), GhostAlpha);
+
+	return ClipMask * GhostMask;
 }

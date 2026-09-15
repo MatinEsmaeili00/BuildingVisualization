@@ -87,6 +87,47 @@ def _log(msg):
     unreal.log("[BuildingVisualization] {}".format(msg))
 
 
+def _connect(src, src_out, dst, dst_in, what):
+    """
+    connect_material_expressions returns False on failure and does not raise.
+
+    Every silent failure here produces the same downstream symptom: the graph
+    compiles fine, the pin sits at its default, and the feature does nothing
+    with no error anywhere. An unconnected dither alpha in particular defaults
+    to fully opaque, which is indistinguishable from "ghosting is broken".
+    So every connection is checked, and a failure is loud.
+    """
+    if not _mel.connect_material_expressions(src, src_out, dst, dst_in):
+        raise RuntimeError(
+            "Failed to connect {}: output '{}' -> input '{}'. The pin name is "
+            "probably wrong for this engine version.".format(what, src_out, dst_in))
+
+
+# The engine dither function's input is "Alpha Threshold" - WITH A SPACE - not
+# "Alpha", which is the obvious guess and silently fails. Determined by probing
+# the live editor, because neither the asset (compressed) nor Python reflection
+# (no function_inputs property) will tell you. An empty name also works, since
+# that binds the first input, but relying on input ORDER is worse than relying
+# on a name: adding an input upstream would silently rebind us.
+DITHER_ALPHA_PIN_CANDIDATES = ["Alpha Threshold", "AlphaThreshold", "Alpha"]
+
+# Set False to bypass the dither entirely - a diagnostic for separating "the
+# ghost value is wrong" from "the dither is not working".
+USE_DITHER = True
+
+
+def _connect_any(src, src_out, dst, candidates, what):
+    """Connects to the first pin name that takes, and says which one it used."""
+    for name in candidates:
+        if _mel.connect_material_expressions(src, src_out, dst, name):
+            _log("Connected {} via pin '{}'.".format(what, name))
+            return name
+    raise RuntimeError(
+        "Failed to connect {} - none of the candidate pin names {} were accepted. "
+        "The engine function's signature has changed; probe it and update "
+        "DITHER_ALPHA_PIN_CANDIDATES.".format(what, candidates))
+
+
 def _param_names():
     """The full ordered list of vector parameters, matching the C++ naming."""
     names = []
@@ -155,8 +196,12 @@ def _build_custom_node_code():
             "Row0_{}".format(i), "Row1_{}".format(i),
             "Row2_{}".format(i), "Params_{}".format(i),
         ])
-    return "return BuildingClip_Evaluate(WorldPos, {}, Globals, FocusSlab, Ghost);".format(
-        ", ".join(args))
+    # Parameters.SvPosition.xy is the pixel coordinate, used for the ghost
+    # stipple. It is read directly from the Custom node's implicit Parameters
+    # struct rather than wired in as a ScreenPosition input - one less
+    # connection to build, and connections are the fragile part here.
+    return ("return BuildingClip_Evaluate(WorldPos, {}, Globals, FocusSlab, Ghost, "
+            "Parameters.SvPosition.xy);".format(", ".join(args)))
 
 
 def create_material_function():
@@ -196,11 +241,9 @@ def create_material_function():
     custom = _mel.create_material_expression_in_function(
         func, unreal.MaterialExpressionCustom, -400, 0)
     custom.set_editor_property("code", _build_custom_node_code())
-    # FLOAT2: .r is the hard clip decision, .g is the ghost coverage. They are
-    # returned separately rather than pre-multiplied because only the ghost
-    # half should go through the dither - dithering the clip mask would make
-    # the cut edge stipple instead of being crisp.
-    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+    # A single float. Clip and ghost are combined inside the .ush, so nothing
+    # downstream has to split channels or multiply - see the graph note below.
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT1)
     custom.set_editor_property("description", "BuildingClip")
     custom.set_editor_property("include_file_paths", [INCLUDE_PATH])
 
@@ -231,61 +274,7 @@ def create_material_function():
     custom.set_editor_property("inputs", custom_inputs)
 
     for ident, node in inputs:
-        _mel.connect_material_expressions(node, "", custom, ident)
-
-    # --- Split the two outputs -------------------------------------------
-    #
-    # A ComponentMask taking .r and .g off a float2 is valid precisely because
-    # the Custom node above declares CMOT_FLOAT2. Masking a channel the source
-    # does not have is a compile error that takes the whole material down and
-    # substitutes the Default Material - so the output type and these masks
-    # have to be changed together, always.
-    clip_mask = _mel.create_material_expression_in_function(
-        func, unreal.MaterialExpressionComponentMask, -200, -80)
-    clip_mask.set_editor_property("r", True)
-    clip_mask.set_editor_property("g", False)
-    clip_mask.set_editor_property("b", False)
-    clip_mask.set_editor_property("a", False)
-    _mel.connect_material_expressions(custom, "", clip_mask, "")
-
-    ghost_mask = _mel.create_material_expression_in_function(
-        func, unreal.MaterialExpressionComponentMask, -200, 80)
-    ghost_mask.set_editor_property("r", False)
-    ghost_mask.set_editor_property("g", True)
-    ghost_mask.set_editor_property("b", False)
-    ghost_mask.set_editor_property("a", False)
-    _mel.connect_material_expressions(custom, "", ghost_mask, "")
-
-    # --- Ghost coverage becomes a stipple --------------------------------
-    #
-    # DitherTemporalAA converts a 0..1 coverage into a per-pixel on/off
-    # pattern that varies with the TAA jitter, so temporal accumulation
-    # resolves it into apparent translucency. This is how UE's own LOD
-    # dithering works.
-    #
-    # The engine node is used rather than a Bayer matrix in the .ush because
-    # it is jitter-aware: a static ordered dither locks to screen space and
-    # crawls when the camera moves, which looks like a rendering artifact
-    # rather than like glass.
-    # DitherTemporalAA is an engine MATERIAL FUNCTION, not a native expression
-    # class - there is no unreal.MaterialExpressionDitherTemporalAA to create.
-    # It has to be referenced the same way any other function is.
-    dither_func = _load_dither_function()
-    if dither_func is None:
-        raise RuntimeError(
-            "Could not load the engine DitherTemporalAA function from any of {}. "
-            "Ghost mode needs it to convert coverage into a temporally-stable "
-            "stipple.".format(DITHER_FUNCTION_PATHS))
-
-    dither = _mel.create_material_expression_in_function(
-        func, unreal.MaterialExpressionMaterialFunctionCall, -100, 80)
-    dither.set_editor_property("material_function", dither_func)
-    _mel.connect_material_expressions(ghost_mask, "", dither, "Alpha")
-
-    combine = _mel.create_material_expression_in_function(
-        func, unreal.MaterialExpressionMultiply, -40, 0)
-    _mel.connect_material_expressions(clip_mask, "", combine, "A")
-    _mel.connect_material_expressions(dither, "", combine, "B")
+        _connect(node, "", custom, ident, "collection param -> custom." + ident)
 
     output = _mel.create_material_expression_in_function(
         func, unreal.MaterialExpressionFunctionOutput, 100, 0)
@@ -293,12 +282,25 @@ def create_material_function():
     output.set_editor_property(
         "description",
         "1 keeps the pixel, 0 removes it. Multiply into Opacity Mask on a Masked material.")
-    _mel.connect_material_expressions(combine, "", output, "")
+    _connect(custom, "", output, "", "custom -> function output")
 
     func.set_editor_property(
         "description",
         "Building Visualization: world-space clip mask. Drive Opacity Mask with this "
         "and set Blend Mode to Masked.")
+
+    # Finalise the function.
+    #
+    # connect_material_expressions returns True for connections made inside a
+    # material function, but without this call they do not survive to the
+    # compiled function - the graph ends up with the nodes present and the
+    # wires missing. Every dependent material then compiles cleanly against an
+    # unconnected pin sitting at its default, so the feature silently does
+    # nothing and there is no error anywhere to find.
+    #
+    # This is also what rebuilds the materials that reference the function, so
+    # in-place edits actually reach the things using them.
+    _mel.update_material_function(func)
 
     unreal.EditorAssetLibrary.save_asset(package)
     _log("Created material function: {}".format(package))
