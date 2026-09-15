@@ -379,6 +379,32 @@ same path that you *know* should be visible (base colour is ideal). If that one
 shows and yours does not, the problem is a material property, not your graph.
 See [the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
 
+### The editor hangs on startup after a script deleted an asset
+
+Symptom: the editor reaches "Engine is initialized", registers its plugins, and
+then stops responding — no crash, no error, the window may never finish
+drawing. A prompt saying *"1 asset editor was open when the editor was last
+closed. Would you like to re-open it?"* may flash up.
+
+Cause: the editor restores whichever asset editors were open last session, and
+one of those assets **no longer exists** — typically because a script deleted
+or replaced it. The entry lives in:
+
+```
+Saved/Config/WindowsEditor/EditorPerProjectUserSettings.ini
+  [AssetEditorToolkitTabLocation]
+  /Game/Path/To/DeletedAsset.DeletedAsset=1
+```
+
+Fix: close the editor, delete that line, relaunch. **Edit this file only while
+the editor is closed** — it is rewritten on shutdown, so changes made while it
+is running are lost (and that is also how MCP autostart settings get silently
+dropped).
+
+This is a real hazard for *this* plugin specifically, because the injector
+deletes and recreates assets. If you had one open when it ran, the next launch
+hangs.
+
 ## Roadmap
 
 - [x] Movable/scalable clip volume actor
