@@ -216,23 +216,29 @@ def create_material_function():
     """
     package = "{}/{}".format(ASSET_PATH, FUNCTION_NAME)
 
-    # Rebuild the graph IN PLACE rather than deleting and recreating the asset.
+    # ALWAYS delete and recreate. Do not "rebuild in place".
     #
-    # Deleting it would dangle the function-call node in every material already
-    # injected - and since this script is meant to be re-run as the system
-    # evolves, that would mean re-injecting the whole building after every
-    # change, or worse, silently leaving materials pointing at nothing. Keeping
-    # the same asset means existing references stay valid and simply pick up
-    # the new graph.
+    # Rebuilding in place is the obvious choice - it preserves the references
+    # in every already-injected material - and it does not work.
+    # connect_material_expressions returns True, update_material_function
+    # reports no error, and the resulting graph has every node present with its
+    # wires missing. The material then compiles cleanly against an unconnected
+    # pin sitting at its default, so the whole effect silently stops, with no
+    # error in any log. It was verified by eye in the material editor: the
+    # nodes were there, the connections were not.
+    #
+    # Creating the asset fresh works reliably. The cost is that references
+    # dangle, so create_assets() re-injects afterwards to repair them - see
+    # reinject_paths there. Slower and less elegant, but it actually works,
+    # which beats elegant every time.
     if unreal.EditorAssetLibrary.does_asset_exist(package):
-        func = unreal.EditorAssetLibrary.load_asset(package)
-        _mel.delete_all_material_expressions_in_function(func)
-        _log("Rebuilding existing material function in place (references preserved).")
-    else:
-        func = _asset_tools.create_asset(
-            FUNCTION_NAME, ASSET_PATH,
-            unreal.MaterialFunction,
-            unreal.MaterialFunctionFactoryNew())
+        unreal.EditorAssetLibrary.delete_asset(package)
+        _log("Deleted previous material function (in-place rebuild is unreliable).")
+
+    func = _asset_tools.create_asset(
+        FUNCTION_NAME, ASSET_PATH,
+        unreal.MaterialFunction,
+        unreal.MaterialFunctionFactoryNew())
 
     collection = unreal.EditorAssetLibrary.load_asset("{}/{}".format(ASSET_PATH, MPC_NAME))
     if collection is None:
@@ -307,11 +313,26 @@ def create_material_function():
     return func
 
 
-def create_assets():
-    """Creates both assets. Safe to re-run; the function is rebuilt each time."""
+def create_assets(reinject_paths=None):
+    """
+    Creates both assets, then repairs materials that referenced the old function.
+
+    reinject_paths matters whenever the system has already been injected
+    somewhere. The material function is deleted and recreated rather than
+    edited in place (see create_material_function for why), which leaves every
+    previously injected material pointing at nothing - and a null function call
+    is silent, so the effect just stops. Passing the content paths you injected
+    into re-points them.
+
+        bv.create_assets(reinject_paths=["/Game/Building", "/Game/LevelPrototyping"])
+    """
     unreal.EditorAssetLibrary.make_directory(ASSET_PATH)
     create_parameter_collection()
     create_material_function()
+
+    for path in (reinject_paths or []):
+        inject_into_path(path)
+
     _log("Setup complete. Point Project Settings > Plugins > Building Visualization "
          "at {}/{}.".format(ASSET_PATH, MPC_NAME))
 
@@ -343,11 +364,23 @@ def inject_into_material(material, func):
     if material is None:
         return False
 
-    # Idempotent: re-running the injector over a path must not stack up calls.
+    # Idempotent, and self-repairing.
+    #
+    # Because the function asset is deleted and recreated on every setup run,
+    # materials injected earlier are left holding a call node whose function is
+    # now null. Re-pointing that node is strictly better than adding a second
+    # one: it keeps whatever downstream wiring the node already had, which in a
+    # material that already used Opacity Mask is the multiply we built for it.
     for expr in unreal.MaterialEditingLibrary.get_material_expressions(material):
         if isinstance(expr, unreal.MaterialExpressionMaterialFunctionCall):
             existing = expr.get_editor_property("material_function")
-            if existing and existing.get_name() == FUNCTION_NAME:
+            if existing is None:
+                expr.set_editor_property("material_function", func)
+                material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+                _mel.recompile_material(material)
+                _log("Repaired dangling function reference in {}.".format(material.get_name()))
+                return True
+            if existing.get_name() == FUNCTION_NAME:
                 return False
 
     call = _mel.create_material_expression(
