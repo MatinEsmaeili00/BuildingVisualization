@@ -64,7 +64,7 @@ No — and this is the distinction the whole design rests on.
 **Meshes and materials are not the same count.** A 400,000-component building
 typically shares a few dozen materials. You are not editing thousands of
 assets; you are editing perhaps thirty, and
-[`Python/setup_building_visualization.py`](Python/setup_building_visualization.py)
+[`Content/Python/setup_building_visualization.py`](Content/Python/setup_building_visualization.py)
 does it in one call:
 
 ```python
@@ -74,9 +74,38 @@ bv.inject_into_path("/Game/Building", dry_run=True)   # check the list
 bv.inject_into_path("/Game/Building")
 ```
 
+Only **Material** assets are touched, never Material Instances — an instance
+inherits its parent's graph, so injecting into the parent covers every instance
+for free. That is why a building sharing one master material across thousands
+of meshes costs exactly one injection.
+
 A per-pixel cut has to execute in the material shader — `clip()` runs nowhere
 else, and no engine switch injects it globally. Given that constraint, the goal
-is to make the per-material cost *one scripted node*, which is what this does.
+is to make the per-material cost *one scripted step*, which is what this does.
+
+### Why there is no material function
+
+The natural design is one `MF_BuildingClip` material function that every
+material calls — one place that knows the collection layout, one node to
+inject. That was built, and it does not work.
+
+**Connections made inside a material function through the Python API do not
+persist.** `connect_material_expressions` returns `True`,
+`update_material_function` reports no error, and the saved graph has every node
+present with its wires missing. The material then compiles cleanly against
+unconnected pins sitting at their defaults, so the effect silently does nothing
+with no error in any log. Verified by opening the generated function and
+looking at it.
+
+Material-**level** graph building through the same API works reliably, so the
+whole node group is built directly in each material instead. The compiled
+shader is identical either way — a material function is inlined at compile time
+regardless — so the only cost is ~21 nodes per material at injection time.
+
+The real trade: the collection layout is now duplicated into every injected
+material, so changing `MaxClipVolumes` or the parameter names means re-running
+the injector rather than editing one asset. `_remove_existing_clip_nodes` makes
+that re-run safe by sweeping the previous generation first.
 
 ---
 
@@ -141,18 +170,42 @@ Two modes compose differently, and getting it wrong produces a confusing tool:
 Intersect the keeps, union the isolates, intersect those two results. Standard
 CSG, and it generalises: a new mode just picks which accumulator it feeds.
 
-### Blend Mode must become Masked
+### Blend Mode must become Masked — and must be set *first*
 
-The injector sets `BLEND_MASKED`, and this is not cosmetic either.
+The injector sets `BLEND_MASKED`, and this matters twice over.
 
-An **Opaque** material still renders in the depth prepass, and **the prepass
-does not evaluate the opacity mask**. Clipped pixels would write depth, then be
-discarded in the base pass — so the wall you cut away would still occlude the
-pipes behind it. You would see through the wall to *nothing*.
+**Why Masked at all.** An **Opaque** material still renders in the depth
+prepass, and **the prepass does not evaluate the opacity mask**. Clipped pixels
+would write depth, then be discarded in the base pass — so the wall you cut away
+would still occlude the pipes behind it. You would see through the wall to
+*nothing*. Masked makes the prepass run the same test, so depth and colour agree.
 
-Masked makes the prepass run the same test, so depth and colour agree. This is
-the single most likely cause of "clipping looks broken", and it is hard to
-diagnose from the symptom.
+**Why the order matters.** This one cost hours, so it is worth stating plainly:
+
+> Connecting `MP_OPACITY_MASK` on a material that is still **Opaque** is
+> accepted and then **ignored**.
+
+The connection is stored. `get_material_property_input_node` reports it
+correctly. The material compiles without a warning. And the mask is never
+evaluated, because an Opaque material has no opacity mask to evaluate. Setting
+Masked *afterwards* does **not** retroactively make the stored connection live —
+it has to be Masked at the moment the connection is made.
+
+Every symptom this produces looks like something else: clipping that silently
+stops, ghosting that never starts, correct parameter values feeding a node that
+is visibly connected and does nothing.
+
+**How it was found**, because the technique generalises: the Custom node was
+wired to return a literal `0.0`, which should have erased every surface — the
+building rendered perfectly intact. Then a constant was connected to Base Colour
+on the *same* material, and it turned red instantly. Same material, same
+`recompile_material` call, one edit visible and the other inert. That ruled out
+the graph, the shader, the parameter collection and the recompile in a single
+step, and left only the property.
+
+When an edit is accepted but has no effect, stop investigating the thing being
+edited and find a second edit through the same path that *does* have an effect.
+The difference between them is the bug.
 
 ---
 
@@ -287,6 +340,44 @@ trigger volume or the walls?"* — both produce a box, and a wrong one just look
 like a badly sized room, so the **class** column is the actual answer.
 `SelectRoom` also warns on its own if a tag is carried by more than one actor
 class, since that union is silently larger than the room.
+
+## Troubleshooting
+
+Every failure in this system presents identically — **nothing happens** — so
+the order below is the order that separates the causes fastest.
+
+**1. `BV.Status` first.** It prints the parameter collection and whether its
+layout validated *before* anything else, because if that is wrong every other
+setting reads as correct while having no effect.
+
+**2. `BV.ListTags` / `BV.DescribeTag`.** Confirms the tag is spelled as you
+think, and — via the class column — which actors actually defined the bounds.
+
+**3. Check which materials your geometry really uses.** The most common cause
+of "it does nothing" is injecting into the wrong material. In our own test
+setup, 16 of 19 tagged walls used the template's `MI_PrototypeGrid_Gray` while
+only 3 used the wall material we had injected. Enumerate it rather than
+assuming:
+
+```python
+for a in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():
+    for c in a.get_components_by_class(unreal.StaticMeshComponent):
+        for m in c.get_materials():
+            print(a.get_name(), m.get_path_name() if m else None)
+```
+
+Remember instances inherit from their parent — inject into the **parent
+Material**, not the instance.
+
+**4. Plugin `.ush` edits require an editor restart.** `recompileshaders
+changed` does **not** pick up an include pulled in through a material Custom
+node. If you have edited the shader and nothing changed, you are still running
+the old code — restart before drawing any conclusion.
+
+**5. If an edit is accepted but has no effect,** test a second edit through the
+same path that you *know* should be visible (base colour is ideal). If that one
+shows and yours does not, the problem is a material property, not your graph.
+See [the blend mode section](#blend-mode-must-become-masked--and-must-be-set-first).
 
 ## Roadmap
 
